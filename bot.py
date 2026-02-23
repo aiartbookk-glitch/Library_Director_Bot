@@ -46,16 +46,12 @@ def save_force_channels(data):
         json.dump(data, f)
 
 
-# ================= FORCE SETUP =================
+# ================= FORCE MANAGEMENT =================
 
 @bot.message_handler(commands=['setforce'])
 def enable_force_setup(message):
     force_setup_mode.add(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        "Forward a message from the channel you want to force."
-    )
-
+    bot.send_message(message.chat.id, "Forward a message from the channel to add.")
 
 @bot.message_handler(func=lambda m: m.from_user.id in force_setup_mode and m.forward_from_chat is not None)
 def save_force_channel(message):
@@ -72,52 +68,93 @@ def save_force_channel(message):
         save_force_channels(channels)
 
     force_setup_mode.remove(message.from_user.id)
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ Channel added to force list.\nID: {channel_id}"
-    )
+    bot.send_message(message.chat.id, f"✅ Added force channel:\n{channel_id}")
 
 
-# ================= CHECK JOIN =================
-
-def is_joined(user_id):
+@bot.message_handler(commands=['listforce'])
+def list_force(message):
     channels = load_force_channels()
 
     if not channels:
-        return True
+        bot.send_message(message.chat.id, "No force channels set.")
+        return
 
-    for channel in channels:
+    text = "📢 Force Channels:\n\n"
+    for ch in channels:
         try:
-            member = bot.get_chat_member(channel, user_id)
-            if member.status in ["left", "kicked"]:
-                return False
+            chat = bot.get_chat(ch)
+            text += f"{chat.title} ({ch})\n"
         except:
-            return False
-    return True
+            text += f"Invalid Channel ({ch})\n"
+
+    bot.send_message(message.chat.id, text)
+
+
+@bot.message_handler(commands=['removeforce'])
+def remove_force(message):
+    args = message.text.split()
+
+    if len(args) != 2:
+        bot.send_message(message.chat.id, "Usage: /removeforce CHANNEL_ID")
+        return
+
+    channel_id = int(args[1])
+    channels = load_force_channels()
+
+    if channel_id in channels:
+        channels.remove(channel_id)
+        save_force_channels(channels)
+        bot.send_message(message.chat.id, "✅ Xóa.")
+    else:
+        bot.send_message(message.chat.id, "Channel not found.")
+
+
+# ================= SAFE CHECK JOIN =================
+
+def is_joined(user_id):
+    channels = load_force_channels()
+    updated = []
+    all_joined = True
+
+    for ch in channels:
+        try:
+            member = bot.get_chat_member(ch, user_id)
+
+            if member.status in ["left", "kicked"]:
+                all_joined = False
+
+            updated.append(ch)
+
+        except:
+            print("Removed invalid force channel:", ch)
+
+    if len(updated) != len(channels):
+        save_force_channels(updated)
+
+    return all_joined
 
 
 def join_required_markup(media_id):
     channels = load_force_channels()
     markup = InlineKeyboardMarkup()
 
-    for channel in channels:
-        chat = bot.get_chat(channel)
-        invite_link = chat.invite_link
+    for ch in channels:
+        try:
+            chat = bot.get_chat(ch)
+            invite = chat.invite_link or bot.export_chat_invite_link(ch)
 
-        if not invite_link:
-            invite_link = bot.export_chat_invite_link(channel)
-
-        markup.add(
-            InlineKeyboardButton(
-                f"📢 Join {chat.title}",
-                url=invite_link
+            markup.add(
+                InlineKeyboardButton(
+                    f"📢 Join {chat.title}",
+                    url=invite
+                )
             )
-        )
+        except:
+            continue
 
     markup.add(
         InlineKeyboardButton(
-            "✅ Kiểm tra đã tham gia kênh",
+            "✅ Kiểm tra đã tham gia đủ",
             callback_data=f"check_{media_id}"
         )
     )
@@ -129,35 +166,26 @@ def join_required_markup(media_id):
 
 def main_menu():
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("📤 Upload File", callback_data="upload")
-    )
-    markup.add(
-        InlineKeyboardButton("📊 My Links", callback_data="mylinks")
-    )
+    markup.add(InlineKeyboardButton("📤 Upload File", callback_data="upload"))
+    markup.add(InlineKeyboardButton("📊 My Links", callback_data="mylinks"))
     return markup
 
 
-# ================= START (FIX DEEP LINK) =================
+# ================= START =================
 
 @bot.message_handler(commands=['start'])
 def start(message):
 
     text = message.text
+    media_id = None
 
     if text.startswith("/start "):
         media_id = text.replace("/start ", "").strip()
-    else:
-        media_id = None
 
     data = load_data()
 
     if not media_id:
-        bot.send_message(
-            message.chat.id,
-            "Welcome!",
-            reply_markup=main_menu()
-        )
+        bot.send_message(message.chat.id, "Welcome!", reply_markup=main_menu())
         return
 
     if media_id not in data:
@@ -167,7 +195,7 @@ def start(message):
     if not is_joined(message.from_user.id):
         bot.send_message(
             message.chat.id,
-            "🚫 Bạn cần tham gia các nhóm/kênh sau để nhận tài liệu.",
+            "🚫 You must join required channels.",
             reply_markup=join_required_markup(media_id)
         )
         return
@@ -175,7 +203,7 @@ def start(message):
     send_files(message.chat.id, media_id)
 
 
-# ================= SEND FILES (KHÔNG ĐỤNG LOGIC ALBUM) =================
+# ================= SEND FILES (ALBUM LOGIC GIỮ NGUYÊN) =================
 
 def send_files(chat_id, media_id):
     data = load_data()
@@ -199,21 +227,14 @@ def send_files(chat_id, media_id):
 
         if item["type"] == "photo":
             bot.send_photo(chat_id, item["file_id"], protect_content=True)
-
         elif item["type"] == "video":
             bot.send_video(chat_id, item["file_id"], protect_content=True)
-
         elif item["type"] == "document":
             bot.send_document(chat_id, item["file_id"], protect_content=True)
-
     else:
         for i in range(0, len(media_list), 10):
             chunk = media_list[i:i+10]
-            bot.send_media_group(
-                chat_id,
-                chunk,
-                protect_content=True
-            )
+            bot.send_media_group(chat_id, chunk, protect_content=True)
 
 
 # ================= CALLBACK =================
@@ -221,7 +242,6 @@ def send_files(chat_id, media_id):
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
 
-    # CHECK JOIN BUTTON
     if call.data.startswith("check_"):
         media_id = call.data.split("_")[1]
 
@@ -231,7 +251,6 @@ def callback(call):
         else:
             bot.answer_callback_query(call.id, "Join all channels first.", show_alert=True)
 
-    # UPLOAD
     elif call.data == "upload":
 
         media_id = secrets.token_urlsafe(8)
@@ -242,26 +261,20 @@ def callback(call):
         }
 
         markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("✅ Finish Upload", callback_data="finish")
-        )
+        markup.add(InlineKeyboardButton("✅ Finish Upload", callback_data="finish"))
 
         bot.edit_message_text(
-            "Send photos / videos / documents now.\nPress Finish when done.",
+            "Send files now.\nPress Finish when done.",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=markup
         )
 
-    # FINISH
     elif call.data == "finish":
 
         user_id = call.from_user.id
 
-        if user_id not in upload_sessions:
-            return
-
-        if not upload_sessions[user_id]["files"]:
+        if user_id not in upload_sessions or not upload_sessions[user_id]["files"]:
             bot.answer_callback_query(call.id, "No files uploaded.")
             return
 
@@ -273,7 +286,6 @@ def callback(call):
             call.message.message_id
         )
 
-    # MY LINKS
     elif call.data == "mylinks":
 
         data = load_data()
@@ -287,23 +299,16 @@ def callback(call):
                 found = True
                 link = f"https://t.me/{BOT_USERNAME}?start={media_id}"
 
-                text += f"📛 {info.get('name','No name')}\n"
-                text += f"🔗 {link}\n"
-                text += f"👁 Views: {info['views']}\n"
-                text += f"📁 Files: {len(info['files'])}\n\n"
+                text += f"{info.get('name')}\n{link}\nViews: {info['views']}\nFiles: {len(info['files'])}\n\n"
 
         markup = InlineKeyboardMarkup()
 
         if found:
-            markup.add(
-                InlineKeyboardButton("🗑 Reset All", callback_data="reset_all")
-            )
+            markup.add(InlineKeyboardButton("🗑 Reset All", callback_data="reset_all"))
         else:
             text = "You have no links yet."
 
-        markup.add(
-            InlineKeyboardButton("⬅ Back", callback_data="back_menu")
-        )
+        markup.add(InlineKeyboardButton("⬅ Back", callback_data="back_menu"))
 
         bot.edit_message_text(
             text,
@@ -313,22 +318,16 @@ def callback(call):
             disable_web_page_preview=True
         )
 
-    # RESET ALL
     elif call.data == "reset_all":
 
         data = load_data()
         user_id = call.from_user.id
 
-        new_data = {
-            media_id: info
-            for media_id, info in data.items()
-            if info.get("owner") != user_id
-        }
-
+        new_data = {k: v for k, v in data.items() if v.get("owner") != user_id}
         save_data(new_data)
 
         bot.edit_message_text(
-            "🗑 All your links have been deleted.",
+            "🗑 All links deleted.",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=main_menu()
@@ -369,7 +368,7 @@ def receive_name(message):
 
     bot.send_message(
         message.chat.id,
-        f"✅ Upload Complete!\n\n🔗 {link}",
+        f"✅ Upload Complete!\n{link}",
         disable_web_page_preview=True
     )
 
@@ -391,13 +390,11 @@ def handle_media(message):
             "type": "photo",
             "file_id": message.photo[-1].file_id
         })
-
     elif message.video:
         upload_sessions[user_id]["files"].append({
             "type": "video",
             "file_id": message.video.file_id
         })
-
     elif message.document:
         upload_sessions[user_id]["files"].append({
             "type": "document",
