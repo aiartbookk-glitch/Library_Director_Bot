@@ -1,13 +1,14 @@
 import telebot
 import json
 import secrets
+import time
 
-# TOKEN GẮN TRỰC TIẾP
 TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
 
 bot = telebot.TeleBot(TOKEN)
 
 DATA_FILE = "data.json"
+temp_albums = {}  # lưu album tạm thời
 
 
 def load_data():
@@ -81,11 +82,28 @@ def handle_files(message, media_id, files):
         )
         return
 
-    if message.content_type in ["photo", "video", "document"]:
-        files.append(message.message_id)
-        bot.reply_to(message, "Saved.")
+    # ===== MEDIA GROUP HANDLING =====
+    if message.media_group_id:
+        group_id = message.media_group_id
+
+        if group_id not in temp_albums:
+            temp_albums[group_id] = []
+
+        temp_albums[group_id].append(message.message_id)
+
+        # đợi 1 chút để Telegram gửi hết album
+        time.sleep(1)
+
+        files.extend(temp_albums[group_id])
+        temp_albums.pop(group_id, None)
+
+        bot.reply_to(message, "Album saved.")
     else:
-        bot.reply_to(message, "Send media only.")
+        if message.content_type in ["photo", "video", "document"]:
+            files.append(message.message_id)
+            bot.reply_to(message, "Saved.")
+        else:
+            bot.reply_to(message, "Send media only.")
 
     bot.register_next_step_handler(message, handle_files, media_id, files)
 
