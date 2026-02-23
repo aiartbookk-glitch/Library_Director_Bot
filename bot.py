@@ -12,6 +12,9 @@ from telebot.types import (
 TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
 bot = telebot.TeleBot(TOKEN)
 
+# LẤY USERNAME 1 LẦN DUY NHẤT (FIX /start? BUG)
+BOT_USERNAME = bot.get_me().username
+
 DATA_FILE = "data.json"
 upload_sessions = {}
 
@@ -60,7 +63,6 @@ def start(message):
         )
         return
 
-    # Mở link file
     media_id = args[1]
 
     if media_id not in data:
@@ -83,7 +85,7 @@ def start(message):
         elif item["type"] == "document":
             media_list.append(InputMediaDocument(item["file_id"]))
 
-    # Gửi lại dạng album
+    # Gửi album chuẩn
     if len(media_list) == 1:
         item = entry["files"][0]
         if item["type"] == "photo":
@@ -123,7 +125,7 @@ def callback(call):
             reply_markup=markup
         )
 
-    # FINISH UPLOAD
+    # FINISH
     elif call.data == "finish":
 
         user_id = call.from_user.id
@@ -155,7 +157,7 @@ def callback(call):
         for media_id, info in data.items():
             if info.get("owner") == user_id:
                 found = True
-                link = f"https://t.me/{bot.get_me().username}?start={media_id}"
+                link = f"https://t.me/{BOT_USERNAME}?start={media_id}"
 
                 text += f"📛 {info.get('name','No name')}\n"
                 text += f"🔗 {link}\n"
@@ -173,7 +175,7 @@ def callback(call):
         )
 
 
-# ================= RECEIVE LINK NAME =================
+# ================= RECEIVE NAME =================
 
 @bot.message_handler(func=lambda m: m.from_user.id in upload_sessions and upload_sessions[m.from_user.id].get("waiting_name"))
 def receive_name(message):
@@ -195,7 +197,7 @@ def receive_name(message):
 
     save_data(data)
 
-    link = f"https://t.me/{bot.get_me().username}?start={media_id}"
+    link = f"https://t.me/{BOT_USERNAME}?start={media_id}"
 
     bot.send_message(
         message.chat.id,
