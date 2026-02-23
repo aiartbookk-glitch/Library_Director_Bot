@@ -4,7 +4,7 @@ import json
 import time
 import secrets
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0")
 bot = telebot.TeleBot(TOKEN)
 
 DATA_FILE = "data.json"
