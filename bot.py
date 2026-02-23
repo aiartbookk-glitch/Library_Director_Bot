@@ -1,14 +1,13 @@
 import telebot
 import json
 import secrets
-import time
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
-
 bot = telebot.TeleBot(TOKEN)
 
 DATA_FILE = "data.json"
-temp_albums = {}  # lưu album tạm thời
+upload_sessions = {}
 
 
 def load_data():
@@ -24,6 +23,15 @@ def save_data(data):
         json.dump(data, f)
 
 
+# ===== MAIN MENU =====
+def main_menu():
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("📤 Upload File", callback_data="upload")
+    )
+    return markup
+
+
 # ===== START =====
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -31,13 +39,17 @@ def start(message):
     data = load_data()
 
     if len(args) == 1:
-        bot.reply_to(message, "Send /upload to upload files.")
+        bot.send_message(
+            message.chat.id,
+            "Welcome!",
+            reply_markup=main_menu()
+        )
         return
 
     media_id = args[1]
 
     if media_id not in data:
-        bot.reply_to(message, "Link not found.")
+        bot.send_message(message.chat.id, "Link not found.")
         return
 
     entry = data[media_id]
@@ -53,59 +65,67 @@ def start(message):
         )
 
 
-# ===== UPLOAD =====
-@bot.message_handler(commands=['upload'])
-def upload(message):
-    media_id = secrets.token_urlsafe(8)
-    bot.reply_to(message, "Send files now. Type DONE when finished.")
-    bot.register_next_step_handler(message, handle_files, media_id, [])
+# ===== CALLBACK HANDLER =====
+@bot.callback_query_handler(func=lambda call: True)
+def callback(call):
+    if call.data == "upload":
+        media_id = secrets.token_urlsafe(8)
 
+        upload_sessions[call.from_user.id] = {
+            "media_id": media_id,
+            "files": [],
+            "from_chat": call.message.chat.id
+        }
 
-def handle_files(message, media_id, files):
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ Finish Upload", callback_data="finish")
+        )
 
-    if message.text == "DONE":
+        bot.edit_message_text(
+            "Send files now.\nWhen finished press Finish.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
+    elif call.data == "finish":
+        user_id = call.from_user.id
+
+        if user_id not in upload_sessions:
+            return
+
+        session = upload_sessions[user_id]
         data = load_data()
 
-        data[media_id] = {
-            "files": files,
+        data[session["media_id"]] = {
+            "files": session["files"],
             "views": 0,
-            "from_chat": message.chat.id
+            "from_chat": session["from_chat"]
         }
 
         save_data(data)
 
-        link = f"https://t.me/{bot.get_me().username}?start={media_id}"
+        link = f"https://t.me/{bot.get_me().username}?start={session['media_id']}"
 
-        bot.send_message(
-            message.chat.id,
-            f"Upload complete!\nViews: 0\nLink:\n{link}"
+        bot.edit_message_text(
+            f"✅ Upload Complete!\nViews: 0\n\nLink:\n{link}",
+            call.message.chat.id,
+            call.message.message_id
         )
+
+        del upload_sessions[user_id]
+
+
+# ===== HANDLE MEDIA =====
+@bot.message_handler(content_types=['photo', 'video', 'document'])
+def handle_media(message):
+    user_id = message.from_user.id
+
+    if user_id not in upload_sessions:
         return
 
-    # ===== MEDIA GROUP HANDLING =====
-    if message.media_group_id:
-        group_id = message.media_group_id
-
-        if group_id not in temp_albums:
-            temp_albums[group_id] = []
-
-        temp_albums[group_id].append(message.message_id)
-
-        # đợi 1 chút để Telegram gửi hết album
-        time.sleep(1)
-
-        files.extend(temp_albums[group_id])
-        temp_albums.pop(group_id, None)
-
-        bot.reply_to(message, "Album saved.")
-    else:
-        if message.content_type in ["photo", "video", "document"]:
-            files.append(message.message_id)
-            bot.reply_to(message, "Saved.")
-        else:
-            bot.reply_to(message, "Send media only.")
-
-    bot.register_next_step_handler(message, handle_files, media_id, files)
+    upload_sessions[user_id]["files"].append(message.message_id)
 
 
 print("Bot running...")
