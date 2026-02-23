@@ -9,7 +9,7 @@ from telebot.types import (
     InputMediaDocument
 )
 
-TOKEN = "YOUR_TOKEN"
+TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
 bot = telebot.TeleBot(TOKEN)
 BOT_USERNAME = bot.get_me().username
 
