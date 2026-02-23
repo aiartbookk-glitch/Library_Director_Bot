@@ -117,7 +117,7 @@ def join_required_markup(media_id):
 
     markup.add(
         InlineKeyboardButton(
-            "✅ I've Joined",
+            "✅ Kiểm tra đã tham gia kênh",
             callback_data=f"check_{media_id}"
         )
     )
@@ -167,7 +167,7 @@ def start(message):
     if not is_joined(message.from_user.id):
         bot.send_message(
             message.chat.id,
-            "🚫 You must join required channels to view this content.",
+            "🚫 Bạn cần tham gia các nhóm/kênh sau để nhận tài liệu.",
             reply_markup=join_required_markup(media_id)
         )
         return
