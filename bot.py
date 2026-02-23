@@ -38,6 +38,9 @@ def main_menu():
     markup.add(
         InlineKeyboardButton("📤 Upload File", callback_data="upload")
     )
+    markup.add(
+        InlineKeyboardButton("📊 My Links", callback_data="mylinks")
+    )
     return markup
 
 
@@ -65,6 +68,8 @@ def start(message):
         return
 
     entry = data[media_id]
+
+    # Tăng view
     entry["views"] += 1
     save_data(data)
 
@@ -78,6 +83,7 @@ def start(message):
         elif item["type"] == "document":
             media_list.append(InputMediaDocument(item["file_id"]))
 
+    # Gửi lại dạng album
     if len(media_list) == 1:
         item = entry["files"][0]
         if item["type"] == "photo":
@@ -94,6 +100,8 @@ def start(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
+
+    # UPLOAD
     if call.data == "upload":
 
         media_id = secrets.token_urlsafe(8)
@@ -115,6 +123,7 @@ def callback(call):
             reply_markup=markup
         )
 
+    # FINISH UPLOAD
     elif call.data == "finish":
 
         user_id = call.from_user.id
@@ -122,30 +131,82 @@ def callback(call):
         if user_id not in upload_sessions:
             return
 
-        session = upload_sessions[user_id]
-
-        if not session["files"]:
+        if not upload_sessions[user_id]["files"]:
             bot.answer_callback_query(call.id, "No files uploaded.")
             return
 
-        data = load_data()
-
-        data[session["media_id"]] = {
-            "files": session["files"],
-            "views": 0
-        }
-
-        save_data(data)
-
-        link = f"https://t.me/{bot.get_me().username}?start={session['media_id']}"
+        upload_sessions[user_id]["waiting_name"] = True
 
         bot.edit_message_text(
-            f"✅ Upload Complete!\nViews: 0\n\nLink:\n{link}",
+            "Enter name for this link:",
             call.message.chat.id,
             call.message.message_id
         )
 
-        del upload_sessions[user_id]
+    # MY LINKS
+    elif call.data == "mylinks":
+
+        data = load_data()
+        user_id = call.from_user.id
+
+        text = "📊 Your Links:\n\n"
+        found = False
+
+        for media_id, info in data.items():
+            if info.get("owner") == user_id:
+                found = True
+                link = f"https://t.me/{bot.get_me().username}?start={media_id}"
+
+                text += f"📛 {info.get('name','No name')}\n"
+                text += f"🔗 {link}\n"
+                text += f"👁 Views: {info['views']}\n"
+                text += f"📁 Files: {len(info['files'])}\n\n"
+
+        if not found:
+            text = "You have no links yet."
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            disable_web_page_preview=True
+        )
+
+
+# ================= RECEIVE LINK NAME =================
+
+@bot.message_handler(func=lambda m: m.from_user.id in upload_sessions and upload_sessions[m.from_user.id].get("waiting_name"))
+def receive_name(message):
+
+    user_id = message.from_user.id
+    session = upload_sessions[user_id]
+
+    link_name = message.text.strip()
+    media_id = session["media_id"]
+
+    data = load_data()
+
+    data[media_id] = {
+        "owner": user_id,
+        "name": link_name,
+        "files": session["files"],
+        "views": 0
+    }
+
+    save_data(data)
+
+    link = f"https://t.me/{bot.get_me().username}?start={media_id}"
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Upload Complete!\n\n"
+        f"📛 Name: {link_name}\n"
+        f"👁 Views: 0\n"
+        f"🔗 {link}",
+        disable_web_page_preview=True
+    )
+
+    del upload_sessions[user_id]
 
 
 # ================= HANDLE MEDIA =================
