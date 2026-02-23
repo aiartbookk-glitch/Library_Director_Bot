@@ -12,7 +12,7 @@ from telebot.types import (
 TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
 bot = telebot.TeleBot(TOKEN)
 
-# LẤY USERNAME 1 LẦN DUY NHẤT (FIX /start? BUG)
+# Lấy username 1 lần duy nhất (fix deep link)
 BOT_USERNAME = bot.get_me().username
 
 DATA_FILE = "data.json"
@@ -85,7 +85,7 @@ def start(message):
         elif item["type"] == "document":
             media_list.append(InputMediaDocument(item["file_id"]))
 
-    # Gửi album chuẩn
+    # Nếu chỉ 1 file
     if len(media_list) == 1:
         item = entry["files"][0]
         if item["type"] == "photo":
@@ -94,8 +94,12 @@ def start(message):
             bot.send_video(message.chat.id, item["file_id"])
         elif item["type"] == "document":
             bot.send_document(message.chat.id, item["file_id"])
+
+    # Nếu nhiều file -> chia nhóm 10
     else:
-        bot.send_media_group(message.chat.id, media_list)
+        for i in range(0, len(media_list), 10):
+            chunk = media_list[i:i+10]
+            bot.send_media_group(message.chat.id, chunk)
 
 
 # ================= CALLBACK =================
