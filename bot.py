@@ -11,8 +11,8 @@ from telebot.types import (
 )
 
 # ====== CONFIG ======
-TOKEN = "YOUR_BOT_TOKEN_HERE"
-BOT_USERNAME = "YOUR_BOT_USERNAME"
+TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
+BOT_USERNAME = "Library_Director_Bot"
 DATA_FILE = "data.json"
 
 bot = telebot.TeleBot(TOKEN)
