@@ -12,11 +12,16 @@ from telebot.types import (
 TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
 bot = telebot.TeleBot(TOKEN)
 
-# Lấy username 1 lần (fix deep link)
 BOT_USERNAME = bot.get_me().username
 
 DATA_FILE = "data.json"
 upload_sessions = {}
+
+# ====== CÁC KÊNH BẮT BUỘC ======
+FORCE_CHANNELS = [
+    "@kenh1_cua_ban",
+    "@kenh2_cua_ban"
+]
 
 
 # ================= DATA =================
@@ -28,22 +33,51 @@ def load_data():
     except:
         return {}
 
-
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f)
+
+
+# ================= CHECK JOIN =================
+
+def is_joined(user_id):
+    for channel in FORCE_CHANNELS:
+        try:
+            member = bot.get_chat_member(channel, user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except:
+            return False
+    return True
+
+
+def join_required_markup(media_id):
+    markup = InlineKeyboardMarkup()
+
+    for channel in FORCE_CHANNELS:
+        markup.add(
+            InlineKeyboardButton(
+                f"📢 Join {channel}",
+                url=f"https://t.me/{channel.replace('@','')}"
+            )
+        )
+
+    markup.add(
+        InlineKeyboardButton(
+            "✅ I've Joined",
+            callback_data=f"check_{media_id}"
+        )
+    )
+
+    return markup
 
 
 # ================= MENU =================
 
 def main_menu():
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("📤 Upload File", callback_data="upload")
-    )
-    markup.add(
-        InlineKeyboardButton("📊 My Links", callback_data="mylinks")
-    )
+    markup.add(InlineKeyboardButton("📤 Upload File", callback_data="upload"))
+    markup.add(InlineKeyboardButton("📊 My Links", callback_data="mylinks"))
     return markup
 
 
@@ -54,13 +88,8 @@ def start(message):
     args = message.text.split()
     data = load_data()
 
-    # Mở bot bình thường
     if len(args) == 1:
-        bot.send_message(
-            message.chat.id,
-            "Welcome!",
-            reply_markup=main_menu()
-        )
+        bot.send_message(message.chat.id, "Welcome!", reply_markup=main_menu())
         return
 
     media_id = args[1]
@@ -69,9 +98,23 @@ def start(message):
         bot.send_message(message.chat.id, "Link not found.")
         return
 
+    if not is_joined(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            "🚫 You must join required channels to view this content.",
+            reply_markup=join_required_markup(media_id)
+        )
+        return
+
+    send_files(message.chat.id, media_id)
+
+
+# ================= SEND FILES =================
+
+def send_files(chat_id, media_id):
+    data = load_data()
     entry = data[media_id]
 
-    # Tăng view
     entry["views"] += 1
     save_data(data)
 
@@ -85,28 +128,20 @@ def start(message):
         elif item["type"] == "document":
             media_list.append(InputMediaDocument(item["file_id"]))
 
-    # Nếu 1 file
     if len(media_list) == 1:
         item = entry["files"][0]
 
         if item["type"] == "photo":
-            bot.send_photo(message.chat.id, item["file_id"], protect_content=True)
-
+            bot.send_photo(chat_id, item["file_id"], protect_content=True)
         elif item["type"] == "video":
-            bot.send_video(message.chat.id, item["file_id"], protect_content=True)
-
+            bot.send_video(chat_id, item["file_id"], protect_content=True)
         elif item["type"] == "document":
-            bot.send_document(message.chat.id, item["file_id"], protect_content=True)
+            bot.send_document(chat_id, item["file_id"], protect_content=True)
 
-    # Nếu nhiều file -> chia nhóm 10
     else:
         for i in range(0, len(media_list), 10):
             chunk = media_list[i:i+10]
-            bot.send_media_group(
-                message.chat.id,
-                chunk,
-                protect_content=True
-            )
+            bot.send_media_group(chat_id, chunk, protect_content=True)
 
 
 # ================= CALLBACK =================
@@ -114,9 +149,18 @@ def start(message):
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
 
-    # UPLOAD
-    if call.data == "upload":
+    # CHECK JOIN BUTTON
+    if call.data.startswith("check_"):
+        media_id = call.data.split("_")[1]
 
+        if is_joined(call.from_user.id):
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            send_files(call.message.chat.id, media_id)
+        else:
+            bot.answer_callback_query(call.id, "You haven't joined all channels yet.", show_alert=True)
+
+    # UPLOAD
+    elif call.data == "upload":
         media_id = secrets.token_urlsafe(8)
 
         upload_sessions[call.from_user.id] = {
@@ -125,12 +169,10 @@ def callback(call):
         }
 
         markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("✅ Finish Upload", callback_data="finish")
-        )
+        markup.add(InlineKeyboardButton("✅ Finish Upload", callback_data="finish"))
 
         bot.edit_message_text(
-            "Send photos / videos / documents now.\nPress Finish when done.",
+            "Send files now.\nPress Finish when done.",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=markup
@@ -196,7 +238,7 @@ def callback(call):
             disable_web_page_preview=True
         )
 
-    # RESET ALL
+    # RESET
     elif call.data == "reset_all":
 
         data = load_data()
@@ -208,17 +250,15 @@ def callback(call):
             if info.get("owner") != user_id
         }
 
-        deleted = len(data) - len(new_data)
         save_data(new_data)
 
         bot.edit_message_text(
-            f"🗑 Reset complete!\nDeleted {deleted} link(s).",
+            "🗑 All your links have been deleted.",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=main_menu()
         )
 
-    # BACK
     elif call.data == "back_menu":
         bot.edit_message_text(
             "Welcome!",
@@ -254,10 +294,7 @@ def receive_name(message):
 
     bot.send_message(
         message.chat.id,
-        f"✅ Upload Complete!\n\n"
-        f"📛 Name: {link_name}\n"
-        f"👁 Views: 0\n"
-        f"🔗 {link}",
+        f"✅ Upload Complete!\n\n🔗 {link}",
         disable_web_page_preview=True
     )
 
@@ -275,24 +312,21 @@ def handle_media(message):
         return
 
     if message.photo:
-        file_id = message.photo[-1].file_id
         upload_sessions[user_id]["files"].append({
             "type": "photo",
-            "file_id": file_id
+            "file_id": message.photo[-1].file_id
         })
 
     elif message.video:
-        file_id = message.video.file_id
         upload_sessions[user_id]["files"].append({
             "type": "video",
-            "file_id": file_id
+            "file_id": message.video.file_id
         })
 
     elif message.document:
-        file_id = message.document.file_id
         upload_sessions[user_id]["files"].append({
             "type": "document",
-            "file_id": file_id
+            "file_id": message.document.file_id
         })
 
 
