@@ -1,6 +1,10 @@
 import telebot
 import json
 import secrets
+import os
+
+if not os.path.exists("/data"):
+    os.makedirs("/data")
 from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
