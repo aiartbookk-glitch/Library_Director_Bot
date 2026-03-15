@@ -14,8 +14,8 @@ bot = telebot.TeleBot(TOKEN)
 
 BOT_USERNAME = bot.get_me().username
 
-DATA_FILE = "data.json"
-FORCE_FILE = "force_channels.json"
+DATA_FILE = "/data/data.json"
+FORCE_FILE = "/data/force_channels.json"
 
 upload_sessions = {}
 force_setup_mode = set()
