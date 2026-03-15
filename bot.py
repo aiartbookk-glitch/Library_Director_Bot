@@ -20,6 +20,15 @@ from telebot.types import (
 
 TOKEN = "8287739944:AAHp-OIJEpGoIEqt6iBiL1DbKnYYE8Lq3i0"
 bot = telebot.TeleBot(TOKEN)
+from telebot.types import BotCommand
+
+bot.set_my_commands([
+    BotCommand("start", "Open bot menu"),
+    BotCommand("setforce", "Add force join channel"),
+    BotCommand("listforce", "Show force channels"),
+    BotCommand("removeforce", "Remove force channel"),
+    BotCommand("data", "Download data.json backup")
+])
 
 BOT_USERNAME = bot.get_me().username
 
