@@ -205,6 +205,11 @@ def start(message):
         return
 
     send_files(message.chat.id, media_id)
+    
+    @bot.message_handler(commands=['data'])
+def view_data(message):
+    with open("/data/data.json") as f:
+        bot.send_document(message.chat.id, f)
 
 
 # ================= SEND FILES (ALBUM LOGIC GIỮ NGUYÊN) =================
