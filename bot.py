@@ -3,8 +3,13 @@ import json
 import secrets
 import os
 
-if not os.path.exists("/data"):
-    os.makedirs("/data")
+if not os.path.exists("/data/data.json"):
+    with open("/data/data.json", "w") as f:
+        f.write("{}")
+
+if not os.path.exists("/data/force_channels.json"):
+    with open("/data/force_channels.json", "w") as f:
+        f.write("[]")
 from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
