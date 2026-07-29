@@ -430,6 +430,10 @@ print("Bot running...")
 
 bot.remove_webhook()
 
+print("Deleting webhook...")
+print(bot.remove_webhook())
+
+print("Starting polling...")
 bot.infinity_polling(
     skip_pending=True,
     timeout=20,
