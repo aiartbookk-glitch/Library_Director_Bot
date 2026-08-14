@@ -6,6 +6,7 @@ import requests
 import time
 import threading
 import queue
+from pathlib import Path
 
 from telebot.types import (
     InlineKeyboardMarkup,
