@@ -8,6 +8,8 @@ import threading
 import queue
 from pathlib import Path
 
+BUILD_VERSION = "PHASE2-FIXED-2026-08-15"
+
 from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -191,9 +193,11 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 
 DB_LOCK = threading.RLock()
 
-BACKUP_KEEP_COUNT = 7
+BACKUP_KEEP_COUNT = 14
 BACKUP_INTERVAL_SECONDS = 24 * 60 * 60
-BACKUP_START_DELAY_SECONDS = 60
+BACKUP_START_DELAY_SECONDS = 30
+DB_BUSY_TIMEOUT_MS = 30_000
+LINK_NOT_FOUND_MESSAGE = "❌ Link này không còn tồn tại hoặc dữ liệu đã bị xóa."
 
 
 def utc_now():
@@ -210,6 +214,7 @@ def db_connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     return conn
 
 
@@ -282,38 +287,46 @@ def db_init():
 
 
 def migrate_legacy_json():
+    """One-time, additive migration from legacy data.json to SQLite.
+
+    This NEVER deletes or overwrites existing SQLite records. It only adds
+    legacy links/files that do not already exist. The marker prevents a stale
+    legacy data.json from resurrecting links after the admin intentionally
+    deletes them later.
+    """
+    marker = os.path.join(DATA_DIR, ".json_migrated_to_sqlite")
+
+    if os.path.exists(marker):
+        print("Legacy JSON migration already completed.")
+        return False
+
+    if not os.path.exists(LEGACY_DATA_FILE):
+        print("Legacy JSON file not found; migration skipped.")
+        return False
+
+    try:
+        with open(LEGACY_DATA_FILE, "r", encoding="utf-8") as f:
+            legacy = json.load(f)
+    except Exception as exc:
+        print(f"Legacy migration skipped: cannot read JSON: {exc}")
+        return False
+
+    if not isinstance(legacy, dict) or not legacy:
+        print("Legacy migration skipped: JSON is empty or invalid.")
+        return False
+
+    migrated_links = 0
+    added_files = 0
+
     with DB_LOCK:
         conn = db_connect()
         try:
-            existing = conn.execute(
-                "SELECT COUNT(*) AS c FROM links"
-            ).fetchone()["c"]
-
-            if existing > 0:
-                return False
-
-            if not os.path.exists(LEGACY_DATA_FILE):
-                return False
-
-            try:
-                with open(
-                    LEGACY_DATA_FILE,
-                    "r",
-                    encoding="utf-8"
-                ) as f:
-                    legacy = json.load(f)
-            except Exception as exc:
-                print(f"Legacy migration skipped: {exc}")
-                return False
-
-            if not isinstance(legacy, dict) or not legacy:
-                return False
-
-            now = utc_now()
-            migrated = 0
-
             for media_id, entry in legacy.items():
                 if not isinstance(entry, dict):
+                    continue
+
+                media_id = str(media_id).strip()
+                if not media_id:
                     continue
 
                 try:
@@ -321,109 +334,113 @@ def migrate_legacy_json():
                 except (TypeError, ValueError):
                     owner_id = 0
 
-                name = str(entry.get("name", media_id))
+                name = str(entry.get("name", media_id)).strip() or media_id
 
                 try:
                     views = int(entry.get("views", 0) or 0)
                 except (TypeError, ValueError):
                     views = 0
 
-                conn.execute(
+                now = utc_now()
+
+                cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO links
-                    (
-                        media_id,
-                        owner_id,
-                        name,
-                        views,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (media_id, owner_id, name, views, created_at, updated_at)
+                    VALUES (:media_id, :owner_id, :name, :views, :created_at, :updated_at)
                     """,
-                    (
-                        media_id,
-                        owner_id,
-                        name,
-                        views,
-                        now,
-                        now
-                    )
+                    {
+                        "media_id": media_id,
+                        "owner_id": owner_id,
+                        "name": name,
+                        "views": views,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
                 )
+                if cur.rowcount > 0:
+                    migrated_links += 1
 
-                for position, item in enumerate(
-                    entry.get("files", [])
-                ):
+                files = entry.get("files", [])
+                if not isinstance(files, list):
+                    continue
+
+                for position, item in enumerate(files):
                     if not isinstance(item, dict):
                         continue
 
-                    file_type = item.get("type")
-                    file_id = item.get("file_id")
-
+                    file_type = str(item.get("type", "")).strip()
+                    file_id = str(item.get("file_id", "")).strip()
                     if not file_type or not file_id:
+                        continue
+
+                    exists = conn.execute(
+                        """
+                        SELECT 1 FROM files
+                        WHERE media_id = :media_id
+                          AND position = :position
+                          AND file_id = :file_id
+                        LIMIT 1
+                        """,
+                        {
+                            "media_id": media_id,
+                            "position": position,
+                            "file_id": file_id,
+                        }
+                    ).fetchone()
+
+                    if exists:
                         continue
 
                     conn.execute(
                         """
                         INSERT INTO files
-                        (
-                            media_id,
-                            position,
-                            file_type,
-                            file_id
-                        )
-                        VALUES (?, ?, ?, ?)
+                        (media_id, position, file_type, file_id)
+                        VALUES (:media_id, :position, :file_type, :file_id)
                         """,
-                        (
-                            media_id,
-                            position,
-                            str(file_type),
-                            str(file_id)
-                        )
+                        {
+                            "media_id": media_id,
+                            "position": position,
+                            "file_type": file_type,
+                            "file_id": file_id,
+                        }
                     )
-
-                migrated += 1
+                    added_files += 1
 
             conn.commit()
 
-            marker = os.path.join(
-                DATA_DIR,
-                ".json_migrated_to_sqlite"
-            )
-
-            Path(marker).write_text(
-                utc_now(),
-                encoding="utf-8"
-            )
+            Path(marker).write_text(utc_now(), encoding="utf-8")
 
             print(
-                f"SQLite migration completed: "
-                f"{migrated} legacy links."
+                "SQLite legacy migration completed: "
+                f"{migrated_links} links, {added_files} files."
             )
-
             return True
 
+        except Exception as exc:
+            conn.rollback()
+            print(f"Legacy migration failed and was rolled back: {exc}")
+            return False
         finally:
             conn.close()
 
 
 def get_link(media_id):
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        return None
+
     with DB_LOCK:
         conn = db_connect()
         try:
             row = conn.execute(
                 """
-                SELECT
-                    media_id,
-                    owner_id,
-                    name,
-                    views,
-                    created_at,
-                    updated_at
+                SELECT media_id, owner_id, name, views, created_at, updated_at
                 FROM links
-                WHERE media_id = ?
+                WHERE media_id = :media_id
+                LIMIT 1
                 """,
-                (media_id,)
+                {"media_id": media_id}
             ).fetchone()
 
             if not row:
@@ -431,15 +448,12 @@ def get_link(media_id):
 
             file_rows = conn.execute(
                 """
-                SELECT
-                    position,
-                    file_type,
-                    file_id
+                SELECT position, file_type, file_id
                 FROM files
-                WHERE media_id = ?
+                WHERE media_id = :media_id
                 ORDER BY position ASC, id ASC
                 """,
-                (media_id,)
+                {"media_id": media_id}
             ).fetchall()
 
             return {
@@ -457,17 +471,21 @@ def get_link(media_id):
                     for item in file_rows
                 ]
             }
-
         finally:
             conn.close()
 
 
-def create_link(
-    media_id,
-    owner_id,
-    name,
-    file_list
-):
+def create_link(media_id, owner_id, name, file_list):
+    media_id = str(media_id or "").strip()
+    name = str(name or "").strip()
+
+    if not media_id:
+        raise ValueError("media_id is empty")
+    if not name:
+        raise ValueError("name is empty")
+    if not isinstance(file_list, list) or not file_list:
+        raise ValueError("file_list is empty")
+
     now = utc_now()
 
     with DB_LOCK:
@@ -476,123 +494,151 @@ def create_link(
             conn.execute(
                 """
                 INSERT INTO links
-                (
-                    media_id,
-                    owner_id,
-                    name,
-                    views,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, 0, ?, ?)
+                (media_id, owner_id, name, views, created_at, updated_at)
+                VALUES (:media_id, :owner_id, :name, 0, :created_at, :updated_at)
                 """,
-                (
-                    media_id,
-                    owner_id,
-                    name,
-                    now,
-                    now
-                )
+                {
+                    "media_id": media_id,
+                    "owner_id": int(owner_id),
+                    "name": name,
+                    "created_at": now,
+                    "updated_at": now,
+                }
             )
 
+            inserted_files = 0
             for position, item in enumerate(file_list):
+                if not isinstance(item, dict):
+                    continue
+                file_type = str(item.get("type", "")).strip()
+                file_id = str(item.get("file_id", "")).strip()
+                if not file_type or not file_id:
+                    continue
+
                 conn.execute(
                     """
                     INSERT INTO files
-                    (
-                        media_id,
-                        position,
-                        file_type,
-                        file_id
-                    )
-                    VALUES (?, ?, ?, ?)
+                    (media_id, position, file_type, file_id)
+                    VALUES (:media_id, :position, :file_type, :file_id)
                     """,
-                    (
-                        media_id,
-                        position,
-                        item["type"],
-                        item["file_id"]
-                    )
+                    {
+                        "media_id": media_id,
+                        "position": position,
+                        "file_type": file_type,
+                        "file_id": file_id,
+                    }
                 )
+                inserted_files += 1
+
+            if inserted_files == 0:
+                raise ValueError("No valid files in upload")
 
             conn.commit()
+            return inserted_files
 
         except Exception:
             conn.rollback()
             raise
-
         finally:
             conn.close()
 
 
-def record_download(
-    media_id,
-    user_id,
-    chat_id,
-    file_count
-):
+def record_download(media_id, user_id, chat_id, file_count):
+    """Atomically record a download.
+
+    Returns True when recorded, False when media_id no longer exists.
+    The stale-link guard is important because users may open very old links
+    after an administrator has deleted the underlying record.
+    """
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        return False
+
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        user_id = 0
+
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        chat_id = 0
+
+    try:
+        file_count = max(0, int(file_count))
+    except (TypeError, ValueError):
+        file_count = 0
+
     now = utc_now()
 
     with DB_LOCK:
         conn = db_connect()
         try:
+            # Guard against old/stale deep links.
+            exists = conn.execute(
+                "SELECT 1 FROM links WHERE media_id = :media_id LIMIT 1",
+                {"media_id": media_id}
+            ).fetchone()
+
+            if not exists:
+                print(f"Download ignored: media_id not found: {media_id}")
+                return False
+
             conn.execute(
                 """
                 UPDATE links
-                SET
-                    views = views + 1,
-                    updated_at = ?
-                WHERE media_id = ?
+                SET views = views + 1, updated_at = :updated_at
+                WHERE media_id = :media_id
                 """,
-                (now, media_id)
+                {
+                    "updated_at": now,
+                    "media_id": media_id,
+                }
             )
 
             conn.execute(
                 """
                 INSERT INTO download_history
-                (
-                    media_id,
-                    user_id,
-                    chat_id,
-                    file_count,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
+                (media_id, user_id, chat_id, file_count, created_at)
+                VALUES (:media_id, :user_id, :chat_id, :file_count, :created_at)
                 """,
-                (
-                    media_id,
-                    user_id,
-                    chat_id,
-                    file_count,
-                    now
-                )
+                {
+                    "media_id": media_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "file_count": file_count,
+                    "created_at": now,
+                }
             )
 
             conn.execute(
                 """
                 INSERT INTO users
-                (
-                    user_id,
-                    first_seen,
-                    last_seen,
-                    download_count
-                )
-                VALUES (?, ?, ?, 1)
-                ON CONFLICT(user_id)
-                DO UPDATE SET
+                (user_id, first_seen, last_seen, download_count)
+                VALUES (:user_id, :first_seen, :last_seen, 1)
+                ON CONFLICT(user_id) DO UPDATE SET
                     last_seen = excluded.last_seen,
-                    download_count =
-                        users.download_count + 1
+                    download_count = users.download_count + 1
                 """,
-                (user_id, now)
+                {
+                    "user_id": user_id,
+                    "first_seen": now,
+                    "last_seen": now,
+                }
             )
 
             conn.commit()
+            return True
 
-        except Exception:
+        except Exception as exc:
             conn.rollback()
+            print(
+                "record_download failed: "
+                f"media_id={media_id}, user_id={user_id}, "
+                f"chat_id={chat_id}, file_count={file_count}, "
+                f"error={exc!r}"
+            )
             raise
-
         finally:
             conn.close()
 
@@ -850,6 +896,34 @@ def cleanup_old_backups():
         )
 
 
+def database_health_check():
+    """Validate the SQLite file at startup without modifying user data."""
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            counts = {}
+            for table in ("links", "files", "download_history", "users"):
+                counts[table] = conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+
+            print(
+                "Database health: "
+                f"integrity={integrity}; "
+                f"links={counts['links']}; "
+                f"files={counts['files']}; "
+                f"history={counts['download_history']}; "
+                f"users={counts['users']}"
+            )
+            return integrity == "ok"
+        except Exception as exc:
+            print(f"Database health check failed: {exc!r}")
+            return False
+        finally:
+            conn.close()
+
+
 def automatic_backup_worker():
     time.sleep(
         BACKUP_START_DELAY_SECONDS
@@ -877,7 +951,9 @@ def automatic_backup_worker():
 
 
 db_init()
+# One-time legacy migration. Never deletes SQLite data.
 migrate_legacy_json()
+database_health_check()
 
 if not os.path.exists(
     FORCE_FILE
@@ -1361,7 +1437,7 @@ def start(message):
 
         bot.send_message(
             message.chat.id,
-            "Link not found."
+            LINK_NOT_FOUND_MESSAGE
         )
 
         return
@@ -1787,7 +1863,7 @@ def enqueue_download(
 
         bot.send_message(
             chat_id,
-            "Link not found."
+            LINK_NOT_FOUND_MESSAGE
         )
 
         return False
@@ -1909,22 +1985,26 @@ def enqueue_download(
             DOWNLOAD_QUEUE.qsize()
         )
 
-    # A request is counted when accepted.
+    # A request is counted when accepted. If the link disappeared between
+    # get_link() and this point, silently skip history instead of generating
+    # a database error for the user.
     try:
-
-        record_download(
+        recorded = record_download(
             media_id=media_id,
             user_id=user_id,
             chat_id=chat_id,
             file_count=len(files)
         )
+        if not recorded:
+            print(f"Download record skipped for stale media_id={media_id}")
+            ACTIVE_DOWNLOAD_USERS.discard(user_id)
+            return False
 
     except Exception as exc:
-
         print(
-            f"Could not record download "
-            f"for {media_id}: {exc}"
+            f"Could not record download for {media_id}: {exc!r}"
         )
+        # The actual download can still proceed even if statistics fail.
 
     if queue_position > 1:
 
@@ -2164,64 +2244,6 @@ def callback(call):
 
         return
 
-        data = load_data()
-
-        user_id = call.from_user.id
-
-        text = "📊 Your Links:\n\n"
-
-        found = False
-
-        for media_id, info in data.items():
-
-            if info.get("owner") == user_id:
-
-                found = True
-
-                link = (
-                    f"https://t.me/"
-                    f"{BOT_USERNAME}"
-                    f"?start={media_id}"
-                )
-
-                text += (
-                    f"{info.get('name')}\n"
-                    f"{link}\n"
-                    f"Views: {info.get('views', 0)}\n"
-                    f"Files: {len(info.get('files', []))}\n\n"
-                )
-
-        markup = InlineKeyboardMarkup()
-
-        if found:
-
-            markup.add(
-                InlineKeyboardButton(
-                    "🗑 Reset All",
-                    callback_data="reset_all"
-                )
-            )
-
-        else:
-
-            text = "You have no links yet."
-
-        markup.add(
-            InlineKeyboardButton(
-                "⬅ Back",
-                callback_data="back_menu"
-            )
-        )
-
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            disable_web_page_preview=True
-        )
-
-        return
 
     # =====================================================
     # RESET ALL
@@ -2721,6 +2743,7 @@ def view_data(message):
 # START BOT
 # =========================================================
 
+print(f"{BUILD_VERSION}")
 print("Bot running...")
 print(f"SQLite database: {DB_FILE}")
 print(f"Backup directory: {BACKUP_DIR}")
