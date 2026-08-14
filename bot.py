@@ -932,6 +932,95 @@ def save_force_channels(data):
         FORCE_FILE
     )
 
+
+# =========================================================
+# ADMIN CHECK
+# =========================================================
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+def admin_only(message):
+    if not is_admin(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            "🚫 Bạn không có quyền sử dụng chức năng này."
+        )
+        return False
+
+    return True
+
+
+def admin_callback_only(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(
+            call.id,
+            "🚫 Bạn không có quyền sử dụng chức năng này.",
+            show_alert=True
+        )
+        return False
+
+    return True
+
+
+# =========================================================
+# BOT COMMANDS
+# =========================================================
+
+# Normal users only see /start.
+bot.set_my_commands([
+    BotCommand(
+        "start",
+        "Open bot"
+    )
+])
+
+# Admin users also get management/statistics/backup commands.
+for admin_id in ADMIN_IDS:
+    try:
+        bot.set_my_commands(
+            [
+                BotCommand(
+                    "start",
+                    "Open bot"
+                ),
+                BotCommand(
+                    "setforce",
+                    "Add force join channel"
+                ),
+                BotCommand(
+                    "listforce",
+                    "Show force channels"
+                ),
+                BotCommand(
+                    "removeforce",
+                    "Remove force channel"
+                ),
+                BotCommand(
+                    "data",
+                    "Download backup ZIP"
+                ),
+                BotCommand(
+                    "backup",
+                    "Create backup ZIP"
+                ),
+                BotCommand(
+                    "stats",
+                    "Show bot statistics"
+                )
+            ],
+            scope=BotCommandScopeChat(
+                admin_id
+            )
+        )
+    except Exception as exc:
+        print(
+            f"Could not set admin commands "
+            f"for {admin_id}: {exc}"
+        )
+
+
 # =========================================================
 # FORCE MANAGEMENT
 # =========================================================
