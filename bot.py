@@ -2,9 +2,10 @@ import telebot
 import json
 import secrets
 import os
+import requests
 import time
 import threading
-import requests
+import queue
 
 from telebot.types import (
     InlineKeyboardMarkup,
@@ -21,13 +22,12 @@ from telebot.types import (
 # CONFIG
 # =========================================================
 
-# Set BOT_TOKEN in Railway Variables / Environment.
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 if not TOKEN:
     raise RuntimeError(
         "BOT_TOKEN environment variable is not set. "
-        "Add your Telegram bot token to the BOT_TOKEN environment variable."
+        "Add your Telegram bot token to Railway Variables."
     )
 
 # =========================================================
@@ -57,47 +57,61 @@ bot = telebot.TeleBot(TOKEN)
 
 
 # =========================================================
-# TELEGRAM SEND / RATE LIMIT PROTECTION
+# PHASE 1 - PARALLEL DOWNLOADS / RATE LIMIT / ANTI-SPAM
 # =========================================================
 
-# Serialize file delivery so multiple users cannot trigger
-# overlapping media-group requests from different handler threads.
-TELEGRAM_SEND_LOCK = threading.Lock()
-TELEGRAM_MIN_INTERVAL = 0.15
-TELEGRAM_MAX_RETRIES = 5
+from concurrent.futures import ThreadPoolExecutor
 
-_last_telegram_send = 0.0
-_last_telegram_send_lock = threading.Lock()
+# ---------------------------------------------------------
+# DOWNLOAD CONCURRENCY
+# ---------------------------------------------------------
+# Users do NOT have to wait for other users' albums to finish.
+# Up to this many download jobs can run concurrently.
+# Telegram API calls inside those jobs are still rate-limited
+# globally and per chat.
+DOWNLOAD_WORKERS = 4
+DOWNLOAD_QUEUE_MAX = 50
+DOWNLOAD_QUEUE = queue.Queue(maxsize=DOWNLOAD_QUEUE_MAX)
+DOWNLOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=DOWNLOAD_WORKERS,
+    thread_name_prefix="download-worker"
+)
 
+DOWNLOAD_STATE_LOCK = threading.Lock()
+ACTIVE_DOWNLOAD_USERS = set()
+LAST_DOWNLOAD_ACCEPTED = {}
+DOWNLOAD_COOLDOWN_SECONDS = 2.0
 
-def _wait_before_telegram_send():
-    """Small global gap between outbound send requests."""
-    global _last_telegram_send
+# ---------------------------------------------------------
+# TELEGRAM FILE-SEND RATE LIMITER
+# ---------------------------------------------------------
+# This is deliberately conservative. If Telegram still returns
+# 429, the retry_after value becomes a temporary global cooldown.
+FILE_SEND_MIN_INTERVAL = 0.12
+MEDIA_GROUP_MIN_INTERVAL_PER_CHAT = 1.05
+FILE_SEND_MAX_RETRIES = 5
 
-    with _last_telegram_send_lock:
-        now = time.monotonic()
-        wait = TELEGRAM_MIN_INTERVAL - (now - _last_telegram_send)
+FILE_RATE_CONDITION = threading.Condition()
+NEXT_FILE_SEND_AT = 0.0
+GLOBAL_TELEGRAM_COOLDOWN_UNTIL = 0.0
 
-        if wait > 0:
-            time.sleep(wait)
-
-        _last_telegram_send = time.monotonic()
+# Last successful file-send time per destination chat.
+CHAT_LAST_MEDIA_SEND = {}
 
 
 def _get_retry_after(exc):
-    """Extract Telegram's retry_after value from a 429 exception."""
+    """Extract Telegram retry_after from a 429 exception."""
     try:
         result_json = getattr(exc, "result_json", None) or {}
         parameters = result_json.get("parameters") or {}
-        value = parameters.get("retry_after")
-        if value is not None:
-            return max(1, int(value))
+        retry_after = parameters.get("retry_after")
+        if retry_after is not None:
+            return max(1, int(retry_after))
     except (TypeError, ValueError, AttributeError):
         pass
 
-    # Fallback for library/version differences.
     try:
-        text = str(exc)
+        text = str(exc).lower()
         marker = "retry after "
         if marker in text:
             value = text.split(marker, 1)[1].split()[0]
@@ -108,98 +122,153 @@ def _get_retry_after(exc):
     return None
 
 
-def telegram_call(method, *args, **kwargs):
-    """Call a Telegram API method with 429-aware retry and backoff."""
-    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+def _acquire_file_send_slot(chat_id, method_name):
+    """Wait until a file-send API call is allowed globally and per chat."""
+    global NEXT_FILE_SEND_AT
+
+    with FILE_RATE_CONDITION:
+        while True:
+            now = time.monotonic()
+
+            global_wait = max(
+                0.0,
+                GLOBAL_TELEGRAM_COOLDOWN_UNTIL - now
+            )
+
+            global_interval_wait = max(
+                0.0,
+                NEXT_FILE_SEND_AT - now
+            )
+
+            chat_wait = 0.0
+
+            # Telegram can be stricter when repeatedly sending into the
+            # same destination chat. Apply per-chat pacing mainly to albums.
+            if method_name == "send_media_group":
+                last_chat_send = CHAT_LAST_MEDIA_SEND.get(chat_id, 0.0)
+                chat_wait = max(
+                    0.0,
+                    MEDIA_GROUP_MIN_INTERVAL_PER_CHAT
+                    - (now - last_chat_send)
+                )
+
+            wait_for = max(
+                global_wait,
+                global_interval_wait,
+                chat_wait
+            )
+
+            if wait_for <= 0:
+                send_time = time.monotonic()
+                NEXT_FILE_SEND_AT = (
+                    send_time + FILE_SEND_MIN_INTERVAL
+                )
+                return
+
+            FILE_RATE_CONDITION.wait(wait_for)
+
+
+def _set_global_telegram_cooldown(seconds):
+    """Pause all file sends after Telegram explicitly reports 429."""
+    global GLOBAL_TELEGRAM_COOLDOWN_UNTIL
+
+    with FILE_RATE_CONDITION:
+        GLOBAL_TELEGRAM_COOLDOWN_UNTIL = max(
+            GLOBAL_TELEGRAM_COOLDOWN_UNTIL,
+            time.monotonic() + max(1, seconds)
+        )
+        FILE_RATE_CONDITION.notify_all()
+
+
+def _mark_file_send_success(chat_id, method_name):
+    if method_name == "send_media_group":
+        with FILE_RATE_CONDITION:
+            CHAT_LAST_MEDIA_SEND[chat_id] = time.monotonic()
+            FILE_RATE_CONDITION.notify_all()
+
+
+def send_file_api(method, chat_id, *args, **kwargs):
+    """Send a file/media-group with pacing, retry, and adaptive 429 handling."""
+    method_name = getattr(method, "__name__", "telegram_method")
+
+    for attempt in range(1, FILE_SEND_MAX_RETRIES + 1):
+        _acquire_file_send_slot(chat_id, method_name)
+
         try:
-            _wait_before_telegram_send()
-            return method(*args, **kwargs)
+            result = method(
+                chat_id,
+                *args,
+                **kwargs
+            )
+
+            _mark_file_send_success(
+                chat_id,
+                method_name
+            )
+
+            return result
 
         except telebot.apihelper.ApiTelegramException as exc:
             retry_after = _get_retry_after(exc)
 
             if retry_after is not None:
+                # Telegram itself tells us how long to back off. Because
+                # this limit is shared by the bot, pause the file sender
+                # globally for that interval rather than hammering again.
                 print(
-                    f"Telegram 429: waiting {retry_after}s "
-                    f"before retry {attempt}/{TELEGRAM_MAX_RETRIES}."
+                    f"Telegram 429 on {method_name}: "
+                    f"retry_after={retry_after}s "
+                    f"(attempt {attempt}/{FILE_SEND_MAX_RETRIES})"
                 )
-                time.sleep(retry_after + 1)
-                continue
 
-            # Retry other Telegram API errors briefly, but do not spin.
-            if attempt < TELEGRAM_MAX_RETRIES:
-                delay = min(2 * attempt, 8)
-                print(
-                    f"Telegram API error on attempt {attempt}/"
-                    f"{TELEGRAM_MAX_RETRIES}: {exc}. "
-                    f"Retrying in {delay}s."
+                _set_global_telegram_cooldown(
+                    retry_after + 1
                 )
-                time.sleep(delay)
-                continue
 
-            raise
+                if attempt < FILE_SEND_MAX_RETRIES:
+                    continue
 
-        except Exception:
-            # Network / unexpected errors: retry with small exponential backoff.
-            if attempt < TELEGRAM_MAX_RETRIES:
-                delay = min(2 ** (attempt - 1), 8)
+            if attempt < FILE_SEND_MAX_RETRIES:
+                delay = min(
+                    2 ** (attempt - 1),
+                    8
+                )
                 print(
-                    f"Telegram send error on attempt {attempt}/"
-                    f"{TELEGRAM_MAX_RETRIES}. Retrying in {delay}s."
+                    f"Telegram API error on {method_name}: {exc}. "
+                    f"Retrying in {delay}s..."
                 )
                 time.sleep(delay)
                 continue
 
             raise
 
+        except Exception as exc:
+            if attempt < FILE_SEND_MAX_RETRIES:
+                delay = min(
+                    2 ** (attempt - 1),
+                    8
+                )
+                print(
+                    f"Telegram send/network error on {method_name}: "
+                    f"{exc}. Retrying in {delay}s..."
+                )
+                time.sleep(delay)
+                continue
 
-def send_media_group_safe(chat_id, media_group):
-    """Send one media group with retry protection."""
-    return telegram_call(
-        bot.send_media_group,
-        chat_id,
-        media_group,
-        protect_content=True
-    )
-
-
-def send_album_safe(chat_id, media_list):
-    """Send an entire album sequentially so chunks cannot interleave."""
-    with TELEGRAM_SEND_LOCK:
-        for i in range(0, len(media_list), 10):
-            chunk = media_list[i:i + 10]
-            send_media_group_safe(chat_id, chunk)
+            raise
 
 
-def send_single_file_safe(chat_id, item):
-    """Send a single Telegram file with the same retry protection."""
-    with TELEGRAM_SEND_LOCK:
-        if item["type"] == "photo":
-            return telegram_call(
-                bot.send_photo,
-                chat_id,
-                item["file_id"],
-                protect_content=True
-            )
-
-        if item["type"] == "video":
-            return telegram_call(
-                bot.send_video,
-                chat_id,
-                item["file_id"],
-                protect_content=True
-            )
-
-        if item["type"] == "document":
-            return telegram_call(
-                bot.send_document,
-                chat_id,
-                item["file_id"],
-                protect_content=True
-            )
-
-        raise ValueError(f"Unsupported file type: {item.get('type')}")
-
+def safe_download_message(chat_id, text):
+    """Best-effort status message for downloads."""
+    try:
+        bot.send_message(
+            chat_id,
+            text
+        )
+    except Exception as exc:
+        print(
+            f"Could not send status message to {chat_id}: {exc}"
+        )
 
 # =========================================================
 # FILES
@@ -337,9 +406,8 @@ def load_data():
 
     try:
         with DATA_LOCK:
-            with open(DATA_FILE, "r") as f:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-
     except Exception:
         return {}
 
@@ -348,13 +416,37 @@ def save_data(data):
 
     with DATA_LOCK:
         tmp_file = f"{DATA_FILE}.tmp"
-        with open(tmp_file, "w") as f:
+
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(
                 data,
                 f,
                 ensure_ascii=False
             )
+
         os.replace(tmp_file, DATA_FILE)
+
+
+def increment_view_count(media_id):
+    """Atomically increment one link's view counter."""
+    with DATA_LOCK:
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return False
+
+        if media_id not in data:
+            return False
+
+        data[media_id]["views"] = data[media_id].get("views", 0) + 1
+
+        tmp_file = f"{DATA_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+        os.replace(tmp_file, DATA_FILE)
+        return True
 
 
 def load_force_channels():
@@ -367,28 +459,6 @@ def load_force_channels():
     except Exception:
 
         return []
-
-
-def increment_view_count(media_id):
-    """Atomically increment a media link's view counter."""
-    with DATA_LOCK:
-        try:
-            with open(DATA_FILE, "r") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-
-        if media_id not in data:
-            return None
-
-        data[media_id]["views"] = data[media_id].get("views", 0) + 1
-
-        tmp_file = f"{DATA_FILE}.tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_file, DATA_FILE)
-
-        return data[media_id]["views"]
 
 
 def save_force_channels(data):
@@ -768,7 +838,8 @@ def start(message):
 
     send_files(
         message.chat.id,
-        media_id
+        media_id,
+        message.from_user.id
     )
 
 
@@ -776,138 +847,271 @@ def start(message):
 # SEND FILES
 # =========================================================
 
-def send_files(chat_id, media_id):
-
-    data = load_data()
-
-    # -----------------------------------------------------
-    # SAFETY CHECK
-    # -----------------------------------------------------
-
-    if media_id not in data:
-
-        bot.send_message(
-            chat_id,
-            "Link not found."
-        )
-
-        return
-
-    entry = data[media_id]
-
-    # -----------------------------------------------------
-    # VIEW COUNT (ATOMIC)
-    # -----------------------------------------------------
-
-    increment_view_count(media_id)
-
-    # Refresh the entry after the atomic update.
-    data = load_data()
-    entry = data[media_id]
-
-    # -----------------------------------------------------
-    # MEDIA LIST
-    # -----------------------------------------------------
-
+def _build_media_list(files):
     media_list = []
 
-    for item in entry["files"]:
+    for item in files:
+        item_type = item.get("type")
 
-        if item["type"] == "photo":
-
+        if item_type == "photo":
             media_list.append(
-                InputMediaPhoto(
-                    item["file_id"]
-                )
+                InputMediaPhoto(item["file_id"])
             )
 
-        elif item["type"] == "video":
-
+        elif item_type == "video":
             media_list.append(
-                InputMediaVideo(
-                    item["file_id"]
-                )
+                InputMediaVideo(item["file_id"])
             )
 
-        elif item["type"] == "document":
-
+        elif item_type == "document":
             media_list.append(
-                InputMediaDocument(
-                    item["file_id"]
-                )
+                InputMediaDocument(item["file_id"])
             )
 
-    # -----------------------------------------------------
-    # NO FILE
-    # -----------------------------------------------------
+    return media_list
+
+
+def _deliver_download_job(job):
+    """Deliver one user's album. Jobs themselves may run concurrently."""
+    chat_id = job["chat_id"]
+    media_id = job["media_id"]
+    files = job["files"]
+
+    media_list = _build_media_list(files)
 
     if not media_list:
-
-        bot.send_message(
+        safe_download_message(
             chat_id,
             "No files available."
         )
-
         return
 
-    # -----------------------------------------------------
-    # SINGLE FILE
-    # -----------------------------------------------------
+    try:
+        if len(media_list) == 1:
+            item = files[0]
+            item_type = item.get("type")
+            file_id = item["file_id"]
 
-    if len(media_list) == 1:
-
-        item = entry["files"][0]
-
-        try:
-            send_single_file_safe(
-                chat_id,
-                item
-            )
-
-        except Exception as e:
-            print(
-                f"Failed to send single file for media_id={media_id}: {e}"
-            )
-            telegram_call(
-                bot.send_message,
-                chat_id,
-                "⚠️ Không thể gửi file lúc này. Vui lòng thử lại sau."
-            )
-
-    # -----------------------------------------------------
-    # MULTIPLE FILES
-    # -----------------------------------------------------
-
-    else:
-
-        # Telegram maximum media group = 10.
-        # Keep the entire album under one lock so another user's album
-        # cannot be inserted between this album's chunks.
-        try:
-            send_album_safe(
-                chat_id,
-                media_list
-            )
-
-        except Exception as e:
-            print(
-                f"Failed to send album for media_id={media_id}: {e}"
-            )
-
-            try:
-                telegram_call(
-                    bot.send_message,
+            if item_type == "photo":
+                send_file_api(
+                    bot.send_photo,
                     chat_id,
-                    "⚠️ Telegram đang giới hạn tốc độ gửi. "
-                    "Vui lòng thử lại sau ít giây."
+                    file_id,
+                    protect_content=True
                 )
-            except Exception as notify_error:
-                print(
-                    f"Failed to send error message: {notify_error}"
+
+            elif item_type == "video":
+                send_file_api(
+                    bot.send_video,
+                    chat_id,
+                    file_id,
+                    protect_content=True
+                )
+
+            elif item_type == "document":
+                send_file_api(
+                    bot.send_document,
+                    chat_id,
+                    file_id,
+                    protect_content=True
+                )
+
+            else:
+                raise ValueError(
+                    f"Unsupported file type: {item_type}"
                 )
 
             return
 
+        # Telegram maximum media group size = 10.
+        # Each group remains atomic, while different users can have
+        # their jobs running concurrently.
+        for i in range(0, len(media_list), 10):
+            chunk = media_list[i:i + 10]
+
+            send_file_api(
+                bot.send_media_group,
+                chat_id,
+                chunk,
+                protect_content=True
+            )
+
+    except Exception as exc:
+        print(
+            f"Download failed: chat_id={chat_id}, "
+            f"media_id={media_id}, error={exc}"
+        )
+
+        safe_download_message(
+            chat_id,
+            "⚠️ Telegram đang bận hoặc giới hạn tốc độ gửi. "
+            "Vui lòng thử lại sau ít giây."
+        )
+
+
+def _download_dispatcher():
+    """Move queued jobs into a bounded concurrent worker pool."""
+    print(
+        f"Download dispatcher started with "
+        f"{DOWNLOAD_WORKERS} workers."
+    )
+
+    while True:
+        job = DOWNLOAD_QUEUE.get()
+
+        try:
+            DOWNLOAD_EXECUTOR.submit(
+                _run_download_job,
+                job
+            )
+        except Exception as exc:
+            print(
+                f"Could not submit download job: {exc}"
+            )
+
+            with DOWNLOAD_STATE_LOCK:
+                ACTIVE_DOWNLOAD_USERS.discard(
+                    job.get("user_id")
+                )
+
+            safe_download_message(
+                job["chat_id"],
+                "⚠️ Không thể bắt đầu lượt tải. "
+                "Vui lòng thử lại sau."
+            )
+
+        finally:
+            DOWNLOAD_QUEUE.task_done()
+
+
+def _run_download_job(job):
+    try:
+        _deliver_download_job(job)
+    except Exception as exc:
+        print(
+            f"Download worker unexpected error: {exc}"
+        )
+    finally:
+        with DOWNLOAD_STATE_LOCK:
+            ACTIVE_DOWNLOAD_USERS.discard(
+                job.get("user_id")
+            )
+
+
+def enqueue_download(chat_id, user_id, media_id):
+    """Accept a download without forcing users to wait for other users."""
+    data = load_data()
+
+    if media_id not in data:
+        bot.send_message(
+            chat_id,
+            "Link not found."
+        )
+        return False
+
+    entry = data[media_id]
+    files = entry.get("files", [])
+
+    if not files:
+        bot.send_message(
+            chat_id,
+            "No files available."
+        )
+        return False
+
+    now = time.monotonic()
+
+    with DOWNLOAD_STATE_LOCK:
+        if user_id in ACTIVE_DOWNLOAD_USERS:
+            safe_download_message(
+                chat_id,
+                "⏳ Bạn đang có một lượt tải đang xử lý. "
+                "Vui lòng chờ lượt hiện tại hoàn tất."
+            )
+            return False
+
+        last_accepted = LAST_DOWNLOAD_ACCEPTED.get(
+            user_id,
+            0.0
+        )
+
+        if now - last_accepted < DOWNLOAD_COOLDOWN_SECONDS:
+            remaining = (
+                DOWNLOAD_COOLDOWN_SECONDS
+                - (now - last_accepted)
+            )
+
+            safe_download_message(
+                chat_id,
+                f"⏳ Vui lòng chờ "
+                f"{max(1, int(remaining + 0.99))} "
+                f"giây rồi thử lại."
+            )
+            return False
+
+        if DOWNLOAD_QUEUE.full():
+            safe_download_message(
+                chat_id,
+                "⚠️ Hệ thống đang xử lý quá nhiều lượt tải. "
+                "Vui lòng thử lại sau."
+            )
+            return False
+
+        # Snapshot the file list so a later admin action does not mutate
+        # an already accepted download job.
+        job = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "media_id": media_id,
+            "files": [dict(item) for item in files]
+        }
+
+        ACTIVE_DOWNLOAD_USERS.add(user_id)
+        LAST_DOWNLOAD_ACCEPTED[user_id] = now
+
+        try:
+            DOWNLOAD_QUEUE.put_nowait(job)
+        except queue.Full:
+            ACTIVE_DOWNLOAD_USERS.discard(user_id)
+
+            safe_download_message(
+                chat_id,
+                "⚠️ Hệ thống đang xử lý quá nhiều lượt tải. "
+                "Vui lòng thử lại sau."
+            )
+            return False
+
+        queued_jobs = DOWNLOAD_QUEUE.qsize()
+
+    # Count a view only after the job has actually been accepted.
+    increment_view_count(media_id)
+
+    # Only show queue information when there are more pending jobs than
+    # the concurrent worker capacity. Otherwise the user starts shortly.
+    if queued_jobs > DOWNLOAD_WORKERS:
+        safe_download_message(
+            chat_id,
+            "⏳ Yêu cầu của bạn đã được nhận và đang chờ xử lý."
+        )
+
+    return True
+
+
+def send_files(chat_id, media_id, user_id):
+    return enqueue_download(
+        chat_id,
+        user_id,
+        media_id
+    )
+
+
+# Start the dispatcher once, after all download functions exist.
+download_dispatcher_thread = threading.Thread(
+    target=_download_dispatcher,
+    name="download-dispatcher",
+    daemon=True
+)
+download_dispatcher_thread.start()
 
 # =========================================================
 # CALLBACK
@@ -946,7 +1150,8 @@ def callback(call):
 
             send_files(
                 call.message.chat.id,
-                media_id
+                media_id,
+                call.from_user.id
             )
 
         else:
@@ -1232,7 +1437,7 @@ def receive_name(message):
 
     WORDPRESS_URL = "https://erobooks.online/wp-json/quick-post/v1/create"
 
-    WORDPRESS_API_KEY = "EroBookQuickPost_7Cd31JmQ4Wn4Pz21"
+    WORDPRESS_API_KEY = os.getenv("WORDPRESS_API_KEY", "").strip()
 
     wordpress_data = {
         "title": link_name,
@@ -1504,36 +1709,17 @@ def view_data(message):
 
 print("Bot running...")
 
-# ---------------------------------------------------------
-# REMOVE WEBHOOK
-# ---------------------------------------------------------
-
-print("Deleting webhook...")
-
 try:
-    print(
-        telegram_call(
-            bot.remove_webhook
-        )
-    )
+    bot.remove_webhook()
+    print("Webhook removed.")
 except Exception as e:
-    print(
-        f"Webhook remove error: {e}"
-    )
-
-
-# ---------------------------------------------------------
-# POLLING
-# ---------------------------------------------------------
+    print(f"Webhook remove error: {e}")
 
 print("Starting polling...")
 
 bot.infinity_polling(
     skip_pending=True,
-    timeout=30,
-    long_polling_timeout=30,
-    allowed_updates=[
-        "message",
-        "callback_query"
-    ]
+    timeout=20,
+    long_polling_timeout=20,
+    allowed_updates=["message", "callback_query"]
 )
