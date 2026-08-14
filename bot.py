@@ -57,46 +57,35 @@ bot = telebot.TeleBot(TOKEN)
 
 
 # =========================================================
-# PHASE 1 - PARALLEL DOWNLOADS / RATE LIMIT / ANTI-SPAM
+# PHASE 1 - DOWNLOAD QUEUE / RATE LIMIT / ANTI-SPAM
 # =========================================================
 
-from concurrent.futures import ThreadPoolExecutor
-
-# ---------------------------------------------------------
-# DOWNLOAD CONCURRENCY
-# ---------------------------------------------------------
-# Users do NOT have to wait for other users' albums to finish.
-# Up to this many download jobs can run concurrently.
-# Telegram API calls inside those jobs are still rate-limited
-# globally and per chat.
-DOWNLOAD_WORKERS = 4
 DOWNLOAD_QUEUE_MAX = 50
 DOWNLOAD_QUEUE = queue.Queue(maxsize=DOWNLOAD_QUEUE_MAX)
-DOWNLOAD_EXECUTOR = ThreadPoolExecutor(
-    max_workers=DOWNLOAD_WORKERS,
-    thread_name_prefix="download-worker"
-)
 
 DOWNLOAD_STATE_LOCK = threading.Lock()
 ACTIVE_DOWNLOAD_USERS = set()
 LAST_DOWNLOAD_ACCEPTED = {}
 DOWNLOAD_COOLDOWN_SECONDS = 2.0
 
-# ---------------------------------------------------------
-# TELEGRAM FILE-SEND RATE LIMITER
-# ---------------------------------------------------------
-# This is deliberately conservative. If Telegram still returns
-# 429, the retry_after value becomes a temporary global cooldown.
-FILE_SEND_MIN_INTERVAL = 0.12
-MEDIA_GROUP_MIN_INTERVAL_PER_CHAT = 1.05
+# Conservative pacing for outbound file-send API calls.
+FILE_SEND_MIN_INTERVAL = 0.35
 FILE_SEND_MAX_RETRIES = 5
+_last_file_send = 0.0
+_last_file_send_lock = threading.Lock()
 
-FILE_RATE_CONDITION = threading.Condition()
-NEXT_FILE_SEND_AT = 0.0
-GLOBAL_TELEGRAM_COOLDOWN_UNTIL = 0.0
 
-# Last successful file-send time per destination chat.
-CHAT_LAST_MEDIA_SEND = {}
+def _wait_before_file_send():
+    global _last_file_send
+
+    with _last_file_send_lock:
+        now = time.monotonic()
+        wait = FILE_SEND_MIN_INTERVAL - (now - _last_file_send)
+
+        if wait > 0:
+            time.sleep(wait)
+
+        _last_file_send = time.monotonic()
 
 
 def _get_retry_after(exc):
@@ -111,7 +100,7 @@ def _get_retry_after(exc):
         pass
 
     try:
-        text = str(exc).lower()
+        text = str(exc)
         marker = "retry after "
         if marker in text:
             value = text.split(marker, 1)[1].split()[0]
@@ -122,119 +111,28 @@ def _get_retry_after(exc):
     return None
 
 
-def _acquire_file_send_slot(chat_id, method_name):
-    """Wait until a file-send API call is allowed globally and per chat."""
-    global NEXT_FILE_SEND_AT
-
-    with FILE_RATE_CONDITION:
-        while True:
-            now = time.monotonic()
-
-            global_wait = max(
-                0.0,
-                GLOBAL_TELEGRAM_COOLDOWN_UNTIL - now
-            )
-
-            global_interval_wait = max(
-                0.0,
-                NEXT_FILE_SEND_AT - now
-            )
-
-            chat_wait = 0.0
-
-            # Telegram can be stricter when repeatedly sending into the
-            # same destination chat. Apply per-chat pacing mainly to albums.
-            if method_name == "send_media_group":
-                last_chat_send = CHAT_LAST_MEDIA_SEND.get(chat_id, 0.0)
-                chat_wait = max(
-                    0.0,
-                    MEDIA_GROUP_MIN_INTERVAL_PER_CHAT
-                    - (now - last_chat_send)
-                )
-
-            wait_for = max(
-                global_wait,
-                global_interval_wait,
-                chat_wait
-            )
-
-            if wait_for <= 0:
-                send_time = time.monotonic()
-                NEXT_FILE_SEND_AT = (
-                    send_time + FILE_SEND_MIN_INTERVAL
-                )
-                return
-
-            FILE_RATE_CONDITION.wait(wait_for)
-
-
-def _set_global_telegram_cooldown(seconds):
-    """Pause all file sends after Telegram explicitly reports 429."""
-    global GLOBAL_TELEGRAM_COOLDOWN_UNTIL
-
-    with FILE_RATE_CONDITION:
-        GLOBAL_TELEGRAM_COOLDOWN_UNTIL = max(
-            GLOBAL_TELEGRAM_COOLDOWN_UNTIL,
-            time.monotonic() + max(1, seconds)
-        )
-        FILE_RATE_CONDITION.notify_all()
-
-
-def _mark_file_send_success(chat_id, method_name):
-    if method_name == "send_media_group":
-        with FILE_RATE_CONDITION:
-            CHAT_LAST_MEDIA_SEND[chat_id] = time.monotonic()
-            FILE_RATE_CONDITION.notify_all()
-
-
-def send_file_api(method, chat_id, *args, **kwargs):
-    """Send a file/media-group with pacing, retry, and adaptive 429 handling."""
-    method_name = getattr(method, "__name__", "telegram_method")
-
+def send_file_api(method, *args, **kwargs):
+    """Send a file/media-group with pacing, retry and 429 handling."""
     for attempt in range(1, FILE_SEND_MAX_RETRIES + 1):
-        _acquire_file_send_slot(chat_id, method_name)
-
         try:
-            result = method(
-                chat_id,
-                *args,
-                **kwargs
-            )
-
-            _mark_file_send_success(
-                chat_id,
-                method_name
-            )
-
-            return result
+            _wait_before_file_send()
+            return method(*args, **kwargs)
 
         except telebot.apihelper.ApiTelegramException as exc:
             retry_after = _get_retry_after(exc)
 
             if retry_after is not None:
-                # Telegram itself tells us how long to back off. Because
-                # this limit is shared by the bot, pause the file sender
-                # globally for that interval rather than hammering again.
                 print(
-                    f"Telegram 429 on {method_name}: "
-                    f"retry_after={retry_after}s "
+                    f"Telegram 429: retry_after={retry_after}s "
                     f"(attempt {attempt}/{FILE_SEND_MAX_RETRIES})"
                 )
-
-                _set_global_telegram_cooldown(
-                    retry_after + 1
-                )
-
-                if attempt < FILE_SEND_MAX_RETRIES:
-                    continue
+                time.sleep(retry_after + 1)
+                continue
 
             if attempt < FILE_SEND_MAX_RETRIES:
-                delay = min(
-                    2 ** (attempt - 1),
-                    8
-                )
+                delay = min(2 ** (attempt - 1), 8)
                 print(
-                    f"Telegram API error on {method_name}: {exc}. "
+                    f"Telegram API error while sending file: {exc}. "
                     f"Retrying in {delay}s..."
                 )
                 time.sleep(delay)
@@ -244,13 +142,10 @@ def send_file_api(method, chat_id, *args, **kwargs):
 
         except Exception as exc:
             if attempt < FILE_SEND_MAX_RETRIES:
-                delay = min(
-                    2 ** (attempt - 1),
-                    8
-                )
+                delay = min(2 ** (attempt - 1), 8)
                 print(
-                    f"Telegram send/network error on {method_name}: "
-                    f"{exc}. Retrying in {delay}s..."
+                    f"Telegram send/network error: {exc}. "
+                    f"Retrying in {delay}s..."
                 )
                 time.sleep(delay)
                 continue
@@ -259,213 +154,782 @@ def send_file_api(method, chat_id, *args, **kwargs):
 
 
 def safe_download_message(chat_id, text):
-    """Best-effort status message for downloads."""
+    """Best-effort status message for queued downloads."""
     try:
-        bot.send_message(
-            chat_id,
-            text
-        )
+        bot.send_message(chat_id, text)
     except Exception as exc:
-        print(
-            f"Could not send status message to {chat_id}: {exc}"
-        )
+        print(f"Could not send queue status to {chat_id}: {exc}")
 
-# =========================================================
-# FILES
-# =========================================================
-
-if not os.path.exists("/data/data.json"):
-    with open("/data/data.json", "w") as f:
-        f.write("{}")
-
-if not os.path.exists("/data/force_channels.json"):
-    with open("/data/force_channels.json", "w") as f:
-        f.write("[]")
 
 
 # =========================================================
-# BOT USERNAME
+# BOT USERNAME / SESSIONS
 # =========================================================
 
 BOT_USERNAME = bot.get_me().username
 
-
-# =========================================================
-# DATA PATH
-# =========================================================
-
-DATA_FILE = "/data/data.json"
-FORCE_FILE = "/data/force_channels.json"
-
-
-# =========================================================
-# SESSIONS
-# =========================================================
-
 upload_sessions = {}
 force_setup_mode = set()
-DATA_LOCK = threading.Lock()
-
 
 # =========================================================
-# ADMIN CHECK
+# PHASE 2 - SQLITE / HISTORY / STATISTICS / BACKUP
 # =========================================================
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+import sqlite3
+from datetime import datetime, timezone, timedelta
+from zipfile import ZipFile, ZIP_DEFLATED
+
+DATA_DIR = "/data"
+DB_FILE = os.path.join(DATA_DIR, "bot.db")
+LEGACY_DATA_FILE = os.path.join(DATA_DIR, "data.json")
+FORCE_FILE = os.path.join(DATA_DIR, "force_channels.json")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+DB_LOCK = threading.RLock()
+
+BACKUP_KEEP_COUNT = 7
+BACKUP_INTERVAL_SECONDS = 24 * 60 * 60
+BACKUP_START_DELAY_SECONDS = 60
 
 
-def admin_only(message):
-    """
-    Kiểm tra user có phải admin không.
-    Dùng cho các command admin.
-    """
-
-    if not is_admin(message.from_user.id):
-        bot.send_message(
-            message.chat.id,
-            "🚫 Bạn không có quyền sử dụng chức năng này."
-        )
-        return False
-
-    return True
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def admin_callback_only(call):
-    """
-    Kiểm tra quyền admin cho callback.
-    """
-
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(
-            call.id,
-            "🚫 Bạn không có quyền sử dụng chức năng này.",
-            show_alert=True
-        )
-        return False
-
-    return True
-
-
-# =========================================================
-# BOT COMMANDS
-# =========================================================
-
-# User bình thường chỉ nhìn thấy /start
-bot.set_my_commands([
-    BotCommand(
-        "start",
-        "Open bot"
+def db_connect():
+    conn = sqlite3.connect(
+        DB_FILE,
+        timeout=30,
+        check_same_thread=False
     )
-])
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
-# Admin sẽ nhìn thấy thêm các command quản trị
-for admin_id in ADMIN_IDS:
+def db_init():
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS links (
+                    media_id TEXT PRIMARY KEY,
+                    owner_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    views INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-    try:
+                CREATE TABLE IF NOT EXISTS files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    file_type TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    FOREIGN KEY(media_id)
+                        REFERENCES links(media_id)
+                        ON DELETE CASCADE
+                );
 
-        bot.set_my_commands(
-            [
-                BotCommand(
-                    "start",
-                    "Open bot"
-                ),
-                BotCommand(
-                    "setforce",
-                    "Add force join channel"
-                ),
-                BotCommand(
-                    "listforce",
-                    "Show force channels"
-                ),
-                BotCommand(
-                    "removeforce",
-                    "Remove force channel"
-                ),
-                BotCommand(
-                    "data",
-                    "Download data.json backup"
+                CREATE INDEX IF NOT EXISTS idx_files_media_id
+                    ON files(media_id);
+
+                CREATE INDEX IF NOT EXISTS idx_links_owner_id
+                    ON links(owner_id);
+
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    download_count INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS download_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    file_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_history_media_id
+                    ON download_history(media_id);
+
+                CREATE INDEX IF NOT EXISTS idx_history_user_id
+                    ON download_history(user_id);
+
+                CREATE INDEX IF NOT EXISTS idx_history_created_at
+                    ON download_history(created_at);
+
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def migrate_legacy_json():
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            existing = conn.execute(
+                "SELECT COUNT(*) AS c FROM links"
+            ).fetchone()["c"]
+
+            if existing > 0:
+                return False
+
+            if not os.path.exists(LEGACY_DATA_FILE):
+                return False
+
+            try:
+                with open(
+                    LEGACY_DATA_FILE,
+                    "r",
+                    encoding="utf-8"
+                ) as f:
+                    legacy = json.load(f)
+            except Exception as exc:
+                print(f"Legacy migration skipped: {exc}")
+                return False
+
+            if not isinstance(legacy, dict) or not legacy:
+                return False
+
+            now = utc_now()
+            migrated = 0
+
+            for media_id, entry in legacy.items():
+                if not isinstance(entry, dict):
+                    continue
+
+                try:
+                    owner_id = int(entry.get("owner", 0))
+                except (TypeError, ValueError):
+                    owner_id = 0
+
+                name = str(entry.get("name", media_id))
+
+                try:
+                    views = int(entry.get("views", 0) or 0)
+                except (TypeError, ValueError):
+                    views = 0
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO links
+                    (
+                        media_id,
+                        owner_id,
+                        name,
+                        views,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        media_id,
+                        owner_id,
+                        name,
+                        views,
+                        now,
+                        now
+                    )
                 )
-            ],
-            scope=BotCommandScopeChat(admin_id)
-        )
 
-    except Exception as e:
+                for position, item in enumerate(
+                    entry.get("files", [])
+                ):
+                    if not isinstance(item, dict):
+                        continue
 
-        print(
-            f"Could not set admin commands for {admin_id}: {e}"
-        )
+                    file_type = item.get("type")
+                    file_id = item.get("file_id")
 
+                    if not file_type or not file_id:
+                        continue
 
-# =========================================================
-# DATA
-# =========================================================
+                    conn.execute(
+                        """
+                        INSERT INTO files
+                        (
+                            media_id,
+                            position,
+                            file_type,
+                            file_id
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            media_id,
+                            position,
+                            str(file_type),
+                            str(file_id)
+                        )
+                    )
 
-def load_data():
+                migrated += 1
 
-    try:
-        with DATA_LOCK:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        return {}
+            conn.commit()
 
-
-def save_data(data):
-
-    with DATA_LOCK:
-        tmp_file = f"{DATA_FILE}.tmp"
-
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(
-                data,
-                f,
-                ensure_ascii=False
+            marker = os.path.join(
+                DATA_DIR,
+                ".json_migrated_to_sqlite"
             )
 
-        os.replace(tmp_file, DATA_FILE)
+            Path(marker).write_text(
+                utc_now(),
+                encoding="utf-8"
+            )
+
+            print(
+                f"SQLite migration completed: "
+                f"{migrated} legacy links."
+            )
+
+            return True
+
+        finally:
+            conn.close()
 
 
-def increment_view_count(media_id):
-    """Atomically increment one link's view counter."""
-    with DATA_LOCK:
+def get_link(media_id):
+    with DB_LOCK:
+        conn = db_connect()
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            row = conn.execute(
+                """
+                SELECT
+                    media_id,
+                    owner_id,
+                    name,
+                    views,
+                    created_at,
+                    updated_at
+                FROM links
+                WHERE media_id = ?
+                """,
+                (media_id,)
+            ).fetchone()
+
+            if not row:
+                return None
+
+            file_rows = conn.execute(
+                """
+                SELECT
+                    position,
+                    file_type,
+                    file_id
+                FROM files
+                WHERE media_id = ?
+                ORDER BY position ASC, id ASC
+                """,
+                (media_id,)
+            ).fetchall()
+
+            return {
+                "media_id": row["media_id"],
+                "owner": row["owner_id"],
+                "name": row["name"],
+                "views": row["views"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "files": [
+                    {
+                        "type": item["file_type"],
+                        "file_id": item["file_id"]
+                    }
+                    for item in file_rows
+                ]
+            }
+
+        finally:
+            conn.close()
+
+
+def create_link(
+    media_id,
+    owner_id,
+    name,
+    file_list
+):
+    now = utc_now()
+
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO links
+                (
+                    media_id,
+                    owner_id,
+                    name,
+                    views,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    media_id,
+                    owner_id,
+                    name,
+                    now,
+                    now
+                )
+            )
+
+            for position, item in enumerate(file_list):
+                conn.execute(
+                    """
+                    INSERT INTO files
+                    (
+                        media_id,
+                        position,
+                        file_type,
+                        file_id
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        media_id,
+                        position,
+                        item["type"],
+                        item["file_id"]
+                    )
+                )
+
+            conn.commit()
+
         except Exception:
-            return False
+            conn.rollback()
+            raise
 
-        if media_id not in data:
-            return False
+        finally:
+            conn.close()
 
-        data[media_id]["views"] = data[media_id].get("views", 0) + 1
 
-        tmp_file = f"{DATA_FILE}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+def record_download(
+    media_id,
+    user_id,
+    chat_id,
+    file_count
+):
+    now = utc_now()
 
-        os.replace(tmp_file, DATA_FILE)
-        return True
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute(
+                """
+                UPDATE links
+                SET
+                    views = views + 1,
+                    updated_at = ?
+                WHERE media_id = ?
+                """,
+                (now, media_id)
+            )
+
+            conn.execute(
+                """
+                INSERT INTO download_history
+                (
+                    media_id,
+                    user_id,
+                    chat_id,
+                    file_count,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    media_id,
+                    user_id,
+                    chat_id,
+                    file_count,
+                    now
+                )
+            )
+
+            conn.execute(
+                """
+                INSERT INTO users
+                (
+                    user_id,
+                    first_seen,
+                    last_seen,
+                    download_count
+                )
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    download_count =
+                        users.download_count + 1
+                """,
+                (user_id, now)
+            )
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        finally:
+            conn.close()
+
+
+def get_owner_links(owner_id):
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            return conn.execute(
+                """
+                SELECT
+                    l.media_id,
+                    l.name,
+                    l.views,
+                    l.created_at,
+                    COUNT(f.id) AS file_count
+                FROM links l
+                LEFT JOIN files f
+                    ON f.media_id = l.media_id
+                WHERE l.owner_id = ?
+                GROUP BY
+                    l.media_id,
+                    l.name,
+                    l.views,
+                    l.created_at
+                ORDER BY l.created_at DESC
+                """,
+                (owner_id,)
+            ).fetchall()
+
+        finally:
+            conn.close()
+
+
+def delete_owner_links(owner_id):
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute(
+                "DELETE FROM links WHERE owner_id = ?",
+                (owner_id,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_statistics():
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            total_links = conn.execute(
+                "SELECT COUNT(*) AS c FROM links"
+            ).fetchone()["c"]
+
+            total_files = conn.execute(
+                "SELECT COUNT(*) AS c FROM files"
+            ).fetchone()["c"]
+
+            total_downloads = conn.execute(
+                "SELECT COUNT(*) AS c FROM download_history"
+            ).fetchone()["c"]
+
+            unique_users = conn.execute(
+                "SELECT COUNT(*) AS c FROM users"
+            ).fetchone()["c"]
+
+            today = datetime.now(
+                timezone.utc
+            ).date().isoformat()
+
+            last_7_days = (
+                datetime.now(timezone.utc)
+                - timedelta(days=7)
+            ).isoformat()
+
+            downloads_today = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM download_history
+                WHERE substr(created_at, 1, 10) = ?
+                """,
+                (today,)
+            ).fetchone()["c"]
+
+            downloads_7_days = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM download_history
+                WHERE created_at >= ?
+                """,
+                (last_7_days,)
+            ).fetchone()["c"]
+
+            top_links = conn.execute(
+                """
+                SELECT
+                    l.media_id,
+                    l.name,
+                    COUNT(h.id) AS downloads
+                FROM links l
+                LEFT JOIN download_history h
+                    ON h.media_id = l.media_id
+                GROUP BY
+                    l.media_id,
+                    l.name,
+                    l.created_at
+                ORDER BY
+                    downloads DESC,
+                    l.created_at DESC
+                LIMIT 10
+                """
+            ).fetchall()
+
+            return {
+                "total_links": total_links,
+                "total_files": total_files,
+                "total_downloads": total_downloads,
+                "unique_users": unique_users,
+                "downloads_today": downloads_today,
+                "downloads_7_days": downloads_7_days,
+                "top_links": top_links
+            }
+
+        finally:
+            conn.close()
+
+
+def create_full_backup_zip():
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d_%H-%M-%S")
+
+    zip_path = os.path.join(
+        BACKUP_DIR,
+        f"bot_backup_{timestamp}.zip"
+    )
+
+    snapshot_path = os.path.join(
+        BACKUP_DIR,
+        f".snapshot_{timestamp}.db"
+    )
+
+    # SQLite online backup gives a consistent snapshot.
+    with DB_LOCK:
+        source = db_connect()
+        destination = sqlite3.connect(
+            snapshot_path
+        )
+
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+
+    try:
+        manifest = {
+            "backup_created_at_utc": utc_now(),
+            "version": "phase2",
+            "files": [
+                "bot.db"
+            ]
+        }
+
+        with ZipFile(
+            zip_path,
+            "w",
+            compression=ZIP_DEFLATED
+        ) as archive:
+
+            archive.write(
+                snapshot_path,
+                arcname="bot.db"
+            )
+
+            if os.path.exists(
+                LEGACY_DATA_FILE
+            ):
+                archive.write(
+                    LEGACY_DATA_FILE,
+                    arcname="data.json"
+                )
+                manifest["files"].append(
+                    "data.json"
+                )
+
+            if os.path.exists(
+                FORCE_FILE
+            ):
+                archive.write(
+                    FORCE_FILE,
+                    arcname="force_channels.json"
+                )
+                manifest["files"].append(
+                    "force_channels.json"
+                )
+
+            marker = os.path.join(
+                DATA_DIR,
+                ".json_migrated_to_sqlite"
+            )
+
+            if os.path.exists(marker):
+                archive.write(
+                    marker,
+                    arcname=".json_migrated_to_sqlite"
+                )
+                manifest["files"].append(
+                    ".json_migrated_to_sqlite"
+                )
+
+            archive.writestr(
+                "manifest.json",
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    indent=2
+                )
+            )
+
+        return zip_path
+
+    finally:
+        try:
+            os.remove(snapshot_path)
+        except OSError:
+            pass
+
+
+def cleanup_old_backups():
+    try:
+        backups = list(
+            Path(BACKUP_DIR).glob(
+                "bot_backup_*.zip"
+            )
+        )
+
+        backups.sort(
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+
+        for old_path in backups[
+            BACKUP_KEEP_COUNT:
+        ]:
+            try:
+                old_path.unlink()
+            except OSError:
+                pass
+
+    except Exception as exc:
+        print(
+            f"Backup cleanup error: {exc}"
+        )
+
+
+def automatic_backup_worker():
+    time.sleep(
+        BACKUP_START_DELAY_SECONDS
+    )
+
+    while True:
+        try:
+            path = create_full_backup_zip()
+            cleanup_old_backups()
+
+            print(
+                f"Automatic backup created: "
+                f"{path}"
+            )
+
+        except Exception as exc:
+            print(
+                f"Automatic backup error: "
+                f"{exc}"
+            )
+
+        time.sleep(
+            BACKUP_INTERVAL_SECONDS
+        )
+
+
+db_init()
+migrate_legacy_json()
+
+if not os.path.exists(
+    FORCE_FILE
+):
+    with open(
+        FORCE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            [],
+            f,
+            ensure_ascii=False
+        )
+
+backup_thread = threading.Thread(
+    target=automatic_backup_worker,
+    name="database-backup-worker",
+    daemon=True
+)
+backup_thread.start()
 
 
 def load_force_channels():
-
     try:
-
-        with open(FORCE_FILE, "r") as f:
+        with open(
+            FORCE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
             return json.load(f)
-
     except Exception:
-
         return []
 
 
 def save_force_channels(data):
+    tmp_file = f"{FORCE_FILE}.tmp"
 
-    with open(FORCE_FILE, "w") as f:
-        json.dump(data, f)
+    with open(
+        tmp_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False
+        )
 
+    os.replace(
+        tmp_file,
+        FORCE_FILE
+    )
 
 # =========================================================
 # FORCE MANAGEMENT
@@ -783,8 +1247,6 @@ def start(message):
             1
         ).strip()
 
-    data = load_data()
-
     # -----------------------------------------------------
     # /start bình thường
     # -----------------------------------------------------
@@ -805,7 +1267,7 @@ def start(message):
     # MEDIA NOT FOUND
     # -----------------------------------------------------
 
-    if media_id not in data:
+    if get_link(media_id) is None:
 
         bot.send_message(
             message.chat.id,
@@ -843,56 +1305,281 @@ def start(message):
     )
 
 
+
 # =========================================================
-# SEND FILES
+# SEND FILES - PHASE 1 CONCURRENT DELIVERY
 # =========================================================
+
+DOWNLOAD_WORKERS = 4
+
+DOWNLOAD_QUEUE_MAX = 50
+DOWNLOAD_QUEUE = queue.Queue(
+    maxsize=DOWNLOAD_QUEUE_MAX
+)
+
+DOWNLOAD_STATE_LOCK = threading.Lock()
+ACTIVE_DOWNLOAD_USERS = set()
+LAST_DOWNLOAD_ACCEPTED = {}
+
+DOWNLOAD_COOLDOWN_SECONDS = 2.0
+
+FILE_SEND_MIN_INTERVAL = 0.35
+FILE_SEND_MAX_RETRIES = 5
+
+_last_file_send = 0.0
+_last_file_send_lock = threading.Lock()
+
+
+def _wait_before_file_send():
+    global _last_file_send
+
+    with _last_file_send_lock:
+
+        now = time.monotonic()
+
+        wait = (
+            FILE_SEND_MIN_INTERVAL
+            - (now - _last_file_send)
+        )
+
+        if wait > 0:
+            time.sleep(wait)
+
+        _last_file_send = (
+            time.monotonic()
+        )
+
+
+def _get_retry_after(exc):
+    try:
+        result_json = getattr(
+            exc,
+            "result_json",
+            None
+        ) or {}
+
+        parameters = (
+            result_json.get("parameters")
+            or {}
+        )
+
+        retry_after = (
+            parameters.get("retry_after")
+        )
+
+        if retry_after is not None:
+            return max(
+                1,
+                int(retry_after)
+            )
+
+    except (
+        TypeError,
+        ValueError,
+        AttributeError
+    ):
+        pass
+
+    text = str(exc)
+    marker = "retry after "
+
+    if marker in text:
+        try:
+            value = (
+                text.split(
+                    marker,
+                    1
+                )[1]
+                .split()[0]
+            )
+
+            return max(
+                1,
+                int(value)
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError
+        ):
+            pass
+
+    return None
+
+
+def send_file_api(
+    method,
+    *args,
+    **kwargs
+):
+    for attempt in range(
+        1,
+        FILE_SEND_MAX_RETRIES + 1
+    ):
+
+        try:
+
+            _wait_before_file_send()
+
+            return method(
+                *args,
+                **kwargs
+            )
+
+        except telebot.apihelper.ApiTelegramException as exc:
+
+            retry_after = _get_retry_after(
+                exc
+            )
+
+            if retry_after is not None:
+
+                print(
+                    "Telegram 429: "
+                    f"retry_after={retry_after}s "
+                    f"(attempt "
+                    f"{attempt}/"
+                    f"{FILE_SEND_MAX_RETRIES})"
+                )
+
+                time.sleep(
+                    retry_after + 1
+                )
+
+                continue
+
+            if attempt < FILE_SEND_MAX_RETRIES:
+
+                delay = min(
+                    2 ** (attempt - 1),
+                    8
+                )
+
+                print(
+                    f"Telegram API error: "
+                    f"{exc}. "
+                    f"Retrying in {delay}s..."
+                )
+
+                time.sleep(delay)
+                continue
+
+            raise
+
+        except Exception as exc:
+
+            if attempt < FILE_SEND_MAX_RETRIES:
+
+                delay = min(
+                    2 ** (attempt - 1),
+                    8
+                )
+
+                print(
+                    f"Telegram send/network "
+                    f"error: {exc}. "
+                    f"Retrying in {delay}s..."
+                )
+
+                time.sleep(delay)
+                continue
+
+            raise
+
+
+def safe_download_message(
+    chat_id,
+    text
+):
+    try:
+        bot.send_message(
+            chat_id,
+            text
+        )
+    except Exception as exc:
+        print(
+            f"Could not send queue status "
+            f"to {chat_id}: {exc}"
+        )
+
 
 def _build_media_list(files):
-    media_list = []
+    result = []
 
     for item in files:
-        item_type = item.get("type")
 
-        if item_type == "photo":
-            media_list.append(
-                InputMediaPhoto(item["file_id"])
+        file_type = item.get("type")
+        file_id = item.get("file_id")
+
+        if not file_id:
+            continue
+
+        if file_type == "photo":
+            result.append(
+                InputMediaPhoto(
+                    file_id
+                )
             )
 
-        elif item_type == "video":
-            media_list.append(
-                InputMediaVideo(item["file_id"])
+        elif file_type == "video":
+            result.append(
+                InputMediaVideo(
+                    file_id
+                )
             )
 
-        elif item_type == "document":
-            media_list.append(
-                InputMediaDocument(item["file_id"])
+        elif file_type == "document":
+            result.append(
+                InputMediaDocument(
+                    file_id
+                )
             )
 
-    return media_list
+    return result
 
 
 def _deliver_download_job(job):
-    """Deliver one user's album. Jobs themselves may run concurrently."""
     chat_id = job["chat_id"]
     media_id = job["media_id"]
     files = job["files"]
 
-    media_list = _build_media_list(files)
+    media_list = _build_media_list(
+        files
+    )
 
     if not media_list:
+
         safe_download_message(
             chat_id,
             "No files available."
         )
+
         return
 
     try:
+
         if len(media_list) == 1:
-            item = files[0]
-            item_type = item.get("type")
+
+            item = next(
+                (
+                    item
+                    for item in files
+                    if item.get("file_id")
+                ),
+                None
+            )
+
+            if not item:
+                raise ValueError(
+                    "No valid file."
+                )
+
+            file_type = item["type"]
             file_id = item["file_id"]
 
-            if item_type == "photo":
+            if file_type == "photo":
+
                 send_file_api(
                     bot.send_photo,
                     chat_id,
@@ -900,7 +1587,8 @@ def _deliver_download_job(job):
                     protect_content=True
                 )
 
-            elif item_type == "video":
+            elif file_type == "video":
+
                 send_file_api(
                     bot.send_video,
                     chat_id,
@@ -908,7 +1596,8 @@ def _deliver_download_job(job):
                     protect_content=True
                 )
 
-            elif item_type == "document":
+            elif file_type == "document":
+
                 send_file_api(
                     bot.send_document,
                     chat_id,
@@ -917,17 +1606,24 @@ def _deliver_download_job(job):
                 )
 
             else:
+
                 raise ValueError(
-                    f"Unsupported file type: {item_type}"
+                    f"Unsupported file type: "
+                    f"{file_type}"
                 )
 
             return
 
-        # Telegram maximum media group size = 10.
-        # Each group remains atomic, while different users can have
-        # their jobs running concurrently.
-        for i in range(0, len(media_list), 10):
-            chunk = media_list[i:i + 10]
+        # Telegram media groups max out at 10.
+        for i in range(
+            0,
+            len(media_list),
+            10
+        ):
+
+            chunk = media_list[
+                i:i + 10
+            ]
 
             send_file_api(
                 bot.send_media_group,
@@ -937,167 +1633,225 @@ def _deliver_download_job(job):
             )
 
     except Exception as exc:
+
         print(
-            f"Download failed: chat_id={chat_id}, "
-            f"media_id={media_id}, error={exc}"
+            f"Download failed: "
+            f"chat_id={chat_id}, "
+            f"media_id={media_id}, "
+            f"error={exc}"
         )
 
         safe_download_message(
             chat_id,
-            "⚠️ Telegram đang bận hoặc giới hạn tốc độ gửi. "
+            "⚠️ Telegram đang bận hoặc "
+            "giới hạn tốc độ gửi. "
             "Vui lòng thử lại sau ít giây."
         )
 
 
-def _download_dispatcher():
-    """Move queued jobs into a bounded concurrent worker pool."""
+def _download_worker(
+    worker_id
+):
     print(
-        f"Download dispatcher started with "
-        f"{DOWNLOAD_WORKERS} workers."
+        f"Download worker "
+        f"{worker_id} started."
     )
 
     while True:
+
         job = DOWNLOAD_QUEUE.get()
 
         try:
-            DOWNLOAD_EXECUTOR.submit(
-                _run_download_job,
+            _deliver_download_job(
                 job
             )
+
         except Exception as exc:
+
             print(
-                f"Could not submit download job: {exc}"
+                f"Download worker "
+                f"{worker_id} error: "
+                f"{exc}"
             )
+
+        finally:
 
             with DOWNLOAD_STATE_LOCK:
                 ACTIVE_DOWNLOAD_USERS.discard(
                     job.get("user_id")
                 )
 
-            safe_download_message(
-                job["chat_id"],
-                "⚠️ Không thể bắt đầu lượt tải. "
-                "Vui lòng thử lại sau."
-            )
-
-        finally:
             DOWNLOAD_QUEUE.task_done()
 
 
-def _run_download_job(job):
-    try:
-        _deliver_download_job(job)
-    except Exception as exc:
-        print(
-            f"Download worker unexpected error: {exc}"
-        )
-    finally:
-        with DOWNLOAD_STATE_LOCK:
-            ACTIVE_DOWNLOAD_USERS.discard(
-                job.get("user_id")
-            )
+def enqueue_download(
+    chat_id,
+    user_id,
+    media_id
+):
+    entry = get_link(
+        media_id
+    )
 
+    if entry is None:
 
-def enqueue_download(chat_id, user_id, media_id):
-    """Accept a download without forcing users to wait for other users."""
-    data = load_data()
-
-    if media_id not in data:
         bot.send_message(
             chat_id,
             "Link not found."
         )
+
         return False
 
-    entry = data[media_id]
-    files = entry.get("files", [])
+    files = entry.get(
+        "files",
+        []
+    )
 
     if not files:
+
         bot.send_message(
             chat_id,
             "No files available."
         )
+
         return False
 
     now = time.monotonic()
 
     with DOWNLOAD_STATE_LOCK:
-        if user_id in ACTIVE_DOWNLOAD_USERS:
+
+        if (
+            user_id
+            in ACTIVE_DOWNLOAD_USERS
+        ):
+
             safe_download_message(
                 chat_id,
-                "⏳ Bạn đang có một lượt tải đang xử lý. "
-                "Vui lòng chờ lượt hiện tại hoàn tất."
+                "⏳ Bạn đang có một lượt "
+                "tải đang xử lý. "
+                "Vui lòng chờ lượt hiện tại "
+                "hoàn tất."
             )
+
             return False
 
-        last_accepted = LAST_DOWNLOAD_ACCEPTED.get(
-            user_id,
-            0.0
+        last_accepted = (
+            LAST_DOWNLOAD_ACCEPTED.get(
+                user_id,
+                0.0
+            )
         )
 
-        if now - last_accepted < DOWNLOAD_COOLDOWN_SECONDS:
+        elapsed = (
+            now - last_accepted
+        )
+
+        if (
+            elapsed
+            < DOWNLOAD_COOLDOWN_SECONDS
+        ):
+
             remaining = (
                 DOWNLOAD_COOLDOWN_SECONDS
-                - (now - last_accepted)
+                - elapsed
             )
 
             safe_download_message(
                 chat_id,
-                f"⏳ Vui lòng chờ "
+                "⏳ Vui lòng chờ "
                 f"{max(1, int(remaining + 0.99))} "
-                f"giây rồi thử lại."
+                "giây rồi thử lại."
             )
+
             return False
 
         if DOWNLOAD_QUEUE.full():
+
             safe_download_message(
                 chat_id,
-                "⚠️ Hệ thống đang xử lý quá nhiều lượt tải. "
+                "⚠️ Bot đang có quá "
+                "nhiều lượt tải. "
                 "Vui lòng thử lại sau."
             )
+
             return False
 
-        # Snapshot the file list so a later admin action does not mutate
-        # an already accepted download job.
         job = {
             "chat_id": chat_id,
             "user_id": user_id,
             "media_id": media_id,
-            "files": [dict(item) for item in files]
+            "files": [
+                dict(item)
+                for item in files
+            ]
         }
 
-        ACTIVE_DOWNLOAD_USERS.add(user_id)
-        LAST_DOWNLOAD_ACCEPTED[user_id] = now
+        ACTIVE_DOWNLOAD_USERS.add(
+            user_id
+        )
+
+        LAST_DOWNLOAD_ACCEPTED[
+            user_id
+        ] = now
 
         try:
-            DOWNLOAD_QUEUE.put_nowait(job)
+
+            DOWNLOAD_QUEUE.put_nowait(
+                job
+            )
+
         except queue.Full:
-            ACTIVE_DOWNLOAD_USERS.discard(user_id)
+
+            ACTIVE_DOWNLOAD_USERS.discard(
+                user_id
+            )
 
             safe_download_message(
                 chat_id,
-                "⚠️ Hệ thống đang xử lý quá nhiều lượt tải. "
+                "⚠️ Bot đang có quá "
+                "nhiều lượt tải. "
                 "Vui lòng thử lại sau."
             )
+
             return False
 
-        queued_jobs = DOWNLOAD_QUEUE.qsize()
+        queue_position = (
+            DOWNLOAD_QUEUE.qsize()
+        )
 
-    # Count a view only after the job has actually been accepted.
-    increment_view_count(media_id)
+    # A request is counted when accepted.
+    try:
 
-    # Only show queue information when there are more pending jobs than
-    # the concurrent worker capacity. Otherwise the user starts shortly.
-    if queued_jobs > DOWNLOAD_WORKERS:
+        record_download(
+            media_id=media_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            file_count=len(files)
+        )
+
+    except Exception as exc:
+
+        print(
+            f"Could not record download "
+            f"for {media_id}: {exc}"
+        )
+
+    if queue_position > 1:
+
         safe_download_message(
             chat_id,
-            "⏳ Yêu cầu của bạn đã được nhận và đang chờ xử lý."
+            "⏳ Yêu cầu đã được nhận "
+            "và đang chờ xử lý."
         )
 
     return True
 
 
-def send_files(chat_id, media_id, user_id):
+def send_files(
+    chat_id,
+    media_id,
+    user_id
+):
     return enqueue_download(
         chat_id,
         user_id,
@@ -1105,14 +1859,28 @@ def send_files(chat_id, media_id, user_id):
     )
 
 
-# Start the dispatcher once, after all download functions exist.
-download_dispatcher_thread = threading.Thread(
-    target=_download_dispatcher,
-    name="download-dispatcher",
-    daemon=True
-)
-download_dispatcher_thread.start()
+download_worker_threads = []
 
+for worker_id in range(
+    1,
+    DOWNLOAD_WORKERS + 1
+):
+
+    thread = threading.Thread(
+        target=_download_worker,
+        args=(worker_id,),
+        name=(
+            f"download-worker-"
+            f"{worker_id}"
+        ),
+        daemon=True
+    )
+
+    thread.start()
+
+    download_worker_threads.append(
+        thread
+    )
 # =========================================================
 # CALLBACK
 # =========================================================
@@ -1245,9 +2013,66 @@ def callback(call):
 
     elif call.data == "mylinks":
 
-        # ADMIN ONLY
         if not admin_callback_only(call):
             return
+
+        rows = get_owner_links(
+            call.from_user.id
+        )
+
+        text = "📊 Your Links:\n\n"
+        found = False
+
+        for row in rows:
+
+            found = True
+
+            link = (
+                f"https://t.me/"
+                f"{BOT_USERNAME}"
+                f"?start={row['media_id']}"
+            )
+
+            text += (
+                f"{row['name']}\n"
+                f"{link}\n"
+                f"Views: {row['views']}\n"
+                f"Files: {row['file_count']}\n\n"
+            )
+
+        markup = InlineKeyboardMarkup()
+
+        if found:
+
+            markup.add(
+                InlineKeyboardButton(
+                    "🗑 Reset All",
+                    callback_data="reset_all"
+                )
+            )
+
+        else:
+
+            text = (
+                "You have no links yet."
+            )
+
+        markup.add(
+            InlineKeyboardButton(
+                "⬅ Back",
+                callback_data="back_menu"
+            )
+        )
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            disable_web_page_preview=True
+        )
+
+        return
 
         data = load_data()
 
@@ -1318,17 +2143,11 @@ def callback(call):
         if not admin_callback_only(call):
             return
 
-        data = load_data()
-
         user_id = call.from_user.id
 
-        new_data = {
-            k: v
-            for k, v in data.items()
-            if v.get("owner") != user_id
-        }
-
-        save_data(new_data)
+        delete_owner_links(
+            user_id
+        )
 
         bot.edit_message_text(
             "🗑 All links deleted.",
@@ -1408,21 +2227,12 @@ def receive_name(message):
 
     media_id = session["media_id"]
 
-    data = load_data()
-
-    data[media_id] = {
-
-        "owner": user_id,
-
-        "name": link_name,
-
-        "files": session["files"],
-
-        "views": 0
-
-    }
-
-    save_data(data)
+    create_link(
+        media_id=media_id,
+        owner_id=user_id,
+        name=link_name,
+        file_list=session["files"]
+    )
 
     # =====================================================
     # CREATE TELEGRAM LINK
@@ -1669,38 +2479,152 @@ def handle_media(message):
         )
 
 
+
 # =========================================================
-# DOWNLOAD DATA
+# STATISTICS
 # =========================================================
 
-@bot.message_handler(commands=['data'])
-def view_data(message):
-
-    # =====================================================
-    # ADMIN ONLY
-    # =====================================================
+@bot.message_handler(commands=['stats'])
+def stats(message):
 
     if not admin_only(message):
         return
 
     try:
 
+        data = get_statistics()
+
+        text = (
+            "📊 Bot Statistics\n\n"
+            f"🔗 Total links: "
+            f"{data['total_links']}\n"
+            f"📦 Total files: "
+            f"{data['total_files']}\n"
+            f"⬇️ Total downloads: "
+            f"{data['total_downloads']}\n"
+            f"👤 Unique users: "
+            f"{data['unique_users']}\n"
+            f"📅 Downloads today: "
+            f"{data['downloads_today']}\n"
+            f"📈 Downloads last 7 days: "
+            f"{data['downloads_7_days']}\n"
+        )
+
+        if data["top_links"]:
+
+            text += (
+                "\n🔥 Top downloads:\n"
+            )
+
+            for index, row in enumerate(
+                data["top_links"],
+                start=1
+            ):
+
+                text += (
+                    f"{index}. "
+                    f"{row['name']} — "
+                    f"{row['downloads']}\n"
+                )
+
+        bot.send_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as exc:
+
+        print(
+            f"Statistics error: {exc}"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Cannot load statistics."
+        )
+
+
+# =========================================================
+# BACKUP
+# =========================================================
+
+def send_backup_to_admin(
+    chat_id
+):
+    try:
+
+        path = (
+            create_full_backup_zip()
+        )
+
+        cleanup_old_backups()
+
+        size_mb = (
+            os.path.getsize(path)
+            / (1024 * 1024)
+        )
+
         with open(
-            DATA_FILE,
+            path,
             "rb"
         ) as f:
 
             bot.send_document(
-                message.chat.id,
-                f
+                chat_id,
+                f,
+                caption=(
+                    "✅ Full bot backup created.\n"
+                    f"📦 Size: {size_mb:.2f} MB\n"
+                    "Includes: bot.db, data.json "
+                    "(if present), force_channels.json "
+                    "and manifest.json."
+                )
             )
 
-    except Exception as e:
+        return True
+
+    except Exception as exc:
+
+        print(
+            f"Backup error: {exc}"
+        )
 
         bot.send_message(
-            message.chat.id,
-            f"❌ Cannot read data file:\n{e}"
+            chat_id,
+            "❌ Cannot create backup."
         )
+
+        return False
+
+
+@bot.message_handler(
+    commands=['backup']
+)
+def backup(message):
+
+    if not admin_only(message):
+        return
+
+    send_backup_to_admin(
+        message.chat.id
+    )
+
+
+# =========================================================
+# /data = BACKUP ALIAS
+# =========================================================
+
+@bot.message_handler(
+    commands=['data']
+)
+def view_data(message):
+
+    if not admin_only(message):
+        return
+
+    send_backup_to_admin(
+        message.chat.id
+    )
 
 
 # =========================================================
@@ -1708,6 +2632,8 @@ def view_data(message):
 # =========================================================
 
 print("Bot running...")
+print(f"SQLite database: {DB_FILE}")
+print(f"Backup directory: {BACKUP_DIR}")
 
 try:
     bot.remove_webhook()
@@ -1721,5 +2647,8 @@ bot.infinity_polling(
     skip_pending=True,
     timeout=20,
     long_polling_timeout=20,
-    allowed_updates=["message", "callback_query"]
+    allowed_updates=[
+        "message",
+        "callback_query"
+    ]
 )
