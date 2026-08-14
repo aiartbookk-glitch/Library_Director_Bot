@@ -1038,97 +1038,103 @@ def receive_name(message):
 
     save_data(data)
 
+    # =====================================================
+    # CREATE TELEGRAM LINK
+    # =====================================================
+
     link = f"https://t.me/{BOT_USERNAME}?start={media_id}"
 
 
-# =====================================================
-# CREATE WORDPRESS QUICK NOTE
-# =====================================================
+    # =====================================================
+    # CREATE WORDPRESS QUICK NOTE
+    # =====================================================
 
-WORDPRESS_URL = "https://erobooks.online/wp-json/quick-post/v1/create"
+    WORDPRESS_URL = "https://erobooks.online/wp-json/quick-post/v1/create"
 
-WORDPRESS_API_KEY = "YOUR_WORDPRESS_API_KEY"
-
-
-wordpress_data = {
-    "title": link_name,
-    "url": link,
-    "media_id": media_id
-}
+    WORDPRESS_API_KEY = "EroBookQuickPost_7Cd31JmQ4Wn4Pz21"
 
 
-wordpress_success = False
-wordpress_post_url = None
+    wordpress_data = {
+        "title": link_name,
+        "url": link,
+        "media_id": media_id
+    }
 
 
-try:
+    wordpress_success = False
 
-    response = requests.post(
-        WORDPRESS_URL,
-        json=wordpress_data,
-        headers={
-            "X-Quick-Post-Key": EroBookQuickPost_7Cd31JmQ4Wn4Pz21
-        },
-        timeout=20
-    )
 
-    if response.status_code == 200:
+    try:
 
-        result = response.json()
+        response = requests.post(
+            WORDPRESS_URL,
+            json=wordpress_data,
+            headers={
+                "X-Quick-Post-Key": WORDPRESS_API_KEY
+            },
+            timeout=20
+        )
 
-        if result.get("success"):
+        if response.status_code == 200:
 
-            wordpress_success = True
-            wordpress_post_url = result.get("post_url")
+            result = response.json()
 
-            print(
-                f"WordPress post created: {wordpress_post_url}"
-            )
+            if result.get("success"):
+
+                wordpress_success = True
+
+                print(
+                    "WordPress post created:",
+                    result.get("post_url")
+                )
+
+            else:
+
+                print(
+                    "WordPress API error:",
+                    result
+                )
 
         else:
 
             print(
-                f"WordPress API error: {result}"
+                "WordPress HTTP error:",
+                response.status_code,
+                response.text
             )
+
+    except Exception as e:
+
+        print(
+            "WordPress connection error:",
+            e
+        )
+
+
+    # =====================================================
+    # SEND TELEGRAM RESULT
+    # =====================================================
+
+    if wordpress_success:
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Upload Complete!\n{link}",
+            disable_web_page_preview=True
+        )
 
     else:
 
-        print(
-            f"WordPress HTTP error: "
-            f"{response.status_code} "
-            f"{response.text}"
+        bot.send_message(
+            message.chat.id,
+            f"✅ Upload Complete!\n"
+            f"{link}\n\n"
+            f"⚠️ WordPress post could not be created.",
+            disable_web_page_preview=True
         )
 
-except Exception as e:
 
-    print(
-        f"WordPress connection error: {e}"
-    )
-
-
-# =====================================================
-# SEND TELEGRAM RESULT
-# =====================================================
-
-if wordpress_success:
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ Upload Complete!\n{link}",
-        disable_web_page_preview=True
-    )
-
-else:
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ Upload Complete!\n{link}\n\n"
-        f"⚠️ WordPress post could not be created.",
-        disable_web_page_preview=True
-    )
-
-
-del upload_sessions[user_id]
+    del upload_sessions[user_id]
 
 
 # =========================================================
