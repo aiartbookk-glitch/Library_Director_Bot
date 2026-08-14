@@ -1046,181 +1046,170 @@ def receive_name(message):
 
 
     # =====================================================
-# CREATE WORDPRESS QUICK NOTE
-# =====================================================
+    # CREATE WORDPRESS QUICK NOTE
+    # =====================================================
 
-WORDPRESS_URL = "https://erobooks.online/wp-json/quick-post/v1/create"
+    WORDPRESS_URL = "https://erobooks.online/wp-json/quick-post/v1/create"
 
-WORDPRESS_API_KEY = "EroBookQuickPost_7Cd31JmQ4Wn4Pz21"
+    WORDPRESS_API_KEY = "EroBookQuickPost_7Cd31JmQ4Wn4Pz21"
 
-
-wordpress_data = {
-    "title": link_name,
-    "url": link,
-    "media_id": media_id
-}
-
-
-wordpress_success = False
-wordpress_post_url = None
-
-
-try:
-
-    response = requests.post(
-        WORDPRESS_URL,
-        json=wordpress_data,
-        headers={
-            "X-Quick-Post-Key": WORDPRESS_API_KEY
-        },
-        timeout=20
-    )
-
-    if response.status_code == 200:
-
-        result = response.json()
-
-        if result.get("success"):
-
-            wordpress_success = True
-
-            wordpress_post_url = result.get("post_url")
-
-            print(
-                "WordPress post created:",
-                wordpress_post_url
-            )
-
-        else:
-
-            print(
-                "WordPress API error:",
-                result
-            )
-
-    else:
-
-        print(
-            "WordPress HTTP error:",
-            response.status_code,
-            response.text
-        )
-
-except Exception as e:
-
-    print(
-        "WordPress connection error:",
-        e
-    )
-
-
-# =====================================================
-# CREATE GETLINK
-# =====================================================
-
-getlink_url = None
-
-
-if wordpress_success and wordpress_post_url:
-
-    GETLINK_API_KEY = os.getenv("GETLINK_API_KEY")
-
-    GETLINK_API_URL = "https://vuotlink.xyz/api/"
-
-    getlink_params = {
-        "api": GETLINK_API_KEY,
-        "url": wordpress_post_url,
-        "alias": link_name
+    wordpress_data = {
+        "title": link_name,
+        "url": link,
+        "media_id": media_id
     }
 
+    wordpress_success = False
+    wordpress_post_url = None
 
     try:
 
-        getlink_response = requests.get(
-            GETLINK_API_URL,
-            params=getlink_params,
+        response = requests.post(
+            WORDPRESS_URL,
+            json=wordpress_data,
+            headers={
+                "X-Quick-Post-Key": WORDPRESS_API_KEY
+            },
             timeout=20
         )
 
+        if response.status_code == 200:
 
-        if getlink_response.status_code == 200:
+            result = response.json()
 
-            getlink_result = getlink_response.json()
+            if result.get("success"):
 
+                wordpress_success = True
 
-            if getlink_result.get("status") == "success":
-
-                getlink_url = getlink_result.get(
-                    "shortenedUrl"
-                )
-
+                wordpress_post_url = result.get("post_url")
 
                 print(
-                    "GetLink created:",
-                    getlink_url
+                    "WordPress post created:",
+                    wordpress_post_url
                 )
 
             else:
 
                 print(
-                    "GetLink API error:",
-                    getlink_result
+                    "WordPress API error:",
+                    result
                 )
-
 
         else:
 
             print(
-                "GetLink HTTP error:",
-                getlink_response.status_code,
-                getlink_response.text
+                "WordPress HTTP error:",
+                response.status_code,
+                response.text
             )
-
 
     except Exception as e:
 
         print(
-            "GetLink connection error:",
+            "WordPress connection error:",
             e
         )
 
 
-# =====================================================
-# SEND TELEGRAM RESULT
-# =====================================================
+    # =====================================================
+    # CREATE GETLINK
+    # =====================================================
 
-if getlink_url:
+    getlink_url = None
 
-    bot.send_message(
-        message.chat.id,
-        f"✅ Upload Complete!\n"
-        f"🔗 {getlink_url}",
-        disable_web_page_preview=True
-    )
+    if wordpress_success and wordpress_post_url:
 
-elif wordpress_success:
+        GETLINK_API_KEY = os.getenv("GETLINK_API_KEY")
 
-    bot.send_message(
-        message.chat.id,
-        f"✅ WordPress Note created!\n"
-        f"🔗 {wordpress_post_url}\n\n"
-        f"⚠️ GetLink could not be created.",
-        disable_web_page_preview=True
-    )
+        GETLINK_API_URL = "https://vuotlink.xyz/api/"
 
-else:
+        getlink_params = {
+            "api": GETLINK_API_KEY,
+            "url": wordpress_post_url,
+            "alias": link_name
+        }
 
-    bot.send_message(
-        message.chat.id,
-        f"✅ Upload Complete!\n"
-        f"{link}\n\n"
-        f"⚠️ WordPress post could not be created.",
-        disable_web_page_preview=True
-    )
+        try:
+
+            getlink_response = requests.get(
+                GETLINK_API_URL,
+                params=getlink_params,
+                timeout=20
+            )
+
+            if getlink_response.status_code == 200:
+
+                getlink_result = getlink_response.json()
+
+                if getlink_result.get("status") == "success":
+
+                    getlink_url = getlink_result.get(
+                        "shortenedUrl"
+                    )
+
+                    print(
+                        "GetLink created:",
+                        getlink_url
+                    )
+
+                else:
+
+                    print(
+                        "GetLink API error:",
+                        getlink_result
+                    )
+
+            else:
+
+                print(
+                    "GetLink HTTP error:",
+                    getlink_response.status_code,
+                    getlink_response.text
+                )
+
+        except Exception as e:
+
+            print(
+                "GetLink connection error:",
+                e
+            )
 
 
-del upload_sessions[user_id]
+    # =====================================================
+    # SEND TELEGRAM RESULT
+    # =====================================================
 
+    if getlink_url:
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Upload Complete!\n"
+            f"🔗 {getlink_url}",
+            disable_web_page_preview=True
+        )
+
+    elif wordpress_success:
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ WordPress Note created!\n"
+            f"🔗 {wordpress_post_url}\n\n"
+            f"⚠️ GetLink could not be created.",
+            disable_web_page_preview=True
+        )
+
+    else:
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Upload Complete!\n"
+            f"{link}\n\n"
+            f"⚠️ WordPress post could not be created.",
+            disable_web_page_preview=True
+        )
+
+
+    del upload_sessions[user_id]
 
 # =========================================================
 # HANDLE MEDIA
