@@ -1132,10 +1132,13 @@ def receive_name(message):
         try:
 
             getlink_response = requests.get(
-                GETLINK_API_URL,
-                params=getlink_params,
-                timeout=20
-            )
+    GETLINK_API_URL,
+    params=getlink_params,
+    headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36"
+    },
+    timeout=20
+)
 
             if getlink_response.status_code == 200:
 
