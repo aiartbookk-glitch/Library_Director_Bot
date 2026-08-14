@@ -2,6 +2,8 @@ import telebot
 import json
 import secrets
 import os
+import time
+import threading
 import requests
 
 from telebot.types import (
@@ -19,7 +21,14 @@ from telebot.types import (
 # CONFIG
 # =========================================================
 
-TOKEN = "8287739944:AAEZP7zpU9zwHxxfX4pAsbKcH0zt3ylgICY"
+# Set BOT_TOKEN in Railway Variables / Environment.
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+if not TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN environment variable is not set. "
+        "Add your Telegram bot token to the BOT_TOKEN environment variable."
+    )
 
 # =========================================================
 # ADMIN USER ID
@@ -45,6 +54,151 @@ ADMIN_IDS = {
 # =========================================================
 
 bot = telebot.TeleBot(TOKEN)
+
+
+# =========================================================
+# TELEGRAM SEND / RATE LIMIT PROTECTION
+# =========================================================
+
+# Serialize file delivery so multiple users cannot trigger
+# overlapping media-group requests from different handler threads.
+TELEGRAM_SEND_LOCK = threading.Lock()
+TELEGRAM_MIN_INTERVAL = 0.15
+TELEGRAM_MAX_RETRIES = 5
+
+_last_telegram_send = 0.0
+_last_telegram_send_lock = threading.Lock()
+
+
+def _wait_before_telegram_send():
+    """Small global gap between outbound send requests."""
+    global _last_telegram_send
+
+    with _last_telegram_send_lock:
+        now = time.monotonic()
+        wait = TELEGRAM_MIN_INTERVAL - (now - _last_telegram_send)
+
+        if wait > 0:
+            time.sleep(wait)
+
+        _last_telegram_send = time.monotonic()
+
+
+def _get_retry_after(exc):
+    """Extract Telegram's retry_after value from a 429 exception."""
+    try:
+        result_json = getattr(exc, "result_json", None) or {}
+        parameters = result_json.get("parameters") or {}
+        value = parameters.get("retry_after")
+        if value is not None:
+            return max(1, int(value))
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+    # Fallback for library/version differences.
+    try:
+        text = str(exc)
+        marker = "retry after "
+        if marker in text:
+            value = text.split(marker, 1)[1].split()[0]
+            return max(1, int(value))
+    except (TypeError, ValueError, IndexError):
+        pass
+
+    return None
+
+
+def telegram_call(method, *args, **kwargs):
+    """Call a Telegram API method with 429-aware retry and backoff."""
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            _wait_before_telegram_send()
+            return method(*args, **kwargs)
+
+        except telebot.apihelper.ApiTelegramException as exc:
+            retry_after = _get_retry_after(exc)
+
+            if retry_after is not None:
+                print(
+                    f"Telegram 429: waiting {retry_after}s "
+                    f"before retry {attempt}/{TELEGRAM_MAX_RETRIES}."
+                )
+                time.sleep(retry_after + 1)
+                continue
+
+            # Retry other Telegram API errors briefly, but do not spin.
+            if attempt < TELEGRAM_MAX_RETRIES:
+                delay = min(2 * attempt, 8)
+                print(
+                    f"Telegram API error on attempt {attempt}/"
+                    f"{TELEGRAM_MAX_RETRIES}: {exc}. "
+                    f"Retrying in {delay}s."
+                )
+                time.sleep(delay)
+                continue
+
+            raise
+
+        except Exception:
+            # Network / unexpected errors: retry with small exponential backoff.
+            if attempt < TELEGRAM_MAX_RETRIES:
+                delay = min(2 ** (attempt - 1), 8)
+                print(
+                    f"Telegram send error on attempt {attempt}/"
+                    f"{TELEGRAM_MAX_RETRIES}. Retrying in {delay}s."
+                )
+                time.sleep(delay)
+                continue
+
+            raise
+
+
+def send_media_group_safe(chat_id, media_group):
+    """Send one media group with retry protection."""
+    return telegram_call(
+        bot.send_media_group,
+        chat_id,
+        media_group,
+        protect_content=True
+    )
+
+
+def send_album_safe(chat_id, media_list):
+    """Send an entire album sequentially so chunks cannot interleave."""
+    with TELEGRAM_SEND_LOCK:
+        for i in range(0, len(media_list), 10):
+            chunk = media_list[i:i + 10]
+            send_media_group_safe(chat_id, chunk)
+
+
+def send_single_file_safe(chat_id, item):
+    """Send a single Telegram file with the same retry protection."""
+    with TELEGRAM_SEND_LOCK:
+        if item["type"] == "photo":
+            return telegram_call(
+                bot.send_photo,
+                chat_id,
+                item["file_id"],
+                protect_content=True
+            )
+
+        if item["type"] == "video":
+            return telegram_call(
+                bot.send_video,
+                chat_id,
+                item["file_id"],
+                protect_content=True
+            )
+
+        if item["type"] == "document":
+            return telegram_call(
+                bot.send_document,
+                chat_id,
+                item["file_id"],
+                protect_content=True
+            )
+
+        raise ValueError(f"Unsupported file type: {item.get('type')}")
 
 
 # =========================================================
@@ -81,6 +235,7 @@ FORCE_FILE = "/data/force_channels.json"
 
 upload_sessions = {}
 force_setup_mode = set()
+DATA_LOCK = threading.Lock()
 
 
 # =========================================================
@@ -181,23 +336,25 @@ for admin_id in ADMIN_IDS:
 def load_data():
 
     try:
-
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
+        with DATA_LOCK:
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
 
     except Exception:
-
         return {}
 
 
 def save_data(data):
 
-    with open(DATA_FILE, "w") as f:
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False
-        )
+    with DATA_LOCK:
+        tmp_file = f"{DATA_FILE}.tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(
+                data,
+                f,
+                ensure_ascii=False
+            )
+        os.replace(tmp_file, DATA_FILE)
 
 
 def load_force_channels():
@@ -210,6 +367,28 @@ def load_force_channels():
     except Exception:
 
         return []
+
+
+def increment_view_count(media_id):
+    """Atomically increment a media link's view counter."""
+    with DATA_LOCK:
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        if media_id not in data:
+            return None
+
+        data[media_id]["views"] = data[media_id].get("views", 0) + 1
+
+        tmp_file = f"{DATA_FILE}.tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_file, DATA_FILE)
+
+        return data[media_id]["views"]
 
 
 def save_force_channels(data):
@@ -617,15 +796,14 @@ def send_files(chat_id, media_id):
     entry = data[media_id]
 
     # -----------------------------------------------------
-    # VIEW COUNT
+    # VIEW COUNT (ATOMIC)
     # -----------------------------------------------------
 
-    entry["views"] = entry.get(
-        "views",
-        0
-    ) + 1
+    increment_view_count(media_id)
 
-    save_data(data)
+    # Refresh the entry after the atomic update.
+    data = load_data()
+    entry = data[media_id]
 
     # -----------------------------------------------------
     # MEDIA LIST
@@ -680,28 +858,20 @@ def send_files(chat_id, media_id):
 
         item = entry["files"][0]
 
-        if item["type"] == "photo":
-
-            bot.send_photo(
+        try:
+            send_single_file_safe(
                 chat_id,
-                item["file_id"],
-                protect_content=True
+                item
             )
 
-        elif item["type"] == "video":
-
-            bot.send_video(
-                chat_id,
-                item["file_id"],
-                protect_content=True
+        except Exception as e:
+            print(
+                f"Failed to send single file for media_id={media_id}: {e}"
             )
-
-        elif item["type"] == "document":
-
-            bot.send_document(
+            telegram_call(
+                bot.send_message,
                 chat_id,
-                item["file_id"],
-                protect_content=True
+                "⚠️ Không thể gửi file lúc này. Vui lòng thử lại sau."
             )
 
     # -----------------------------------------------------
@@ -710,22 +880,33 @@ def send_files(chat_id, media_id):
 
     else:
 
-        # Telegram maximum media group = 10
-        for i in range(
-            0,
-            len(media_list),
-            10
-        ):
-
-            chunk = media_list[
-                i:i + 10
-            ]
-
-            bot.send_media_group(
+        # Telegram maximum media group = 10.
+        # Keep the entire album under one lock so another user's album
+        # cannot be inserted between this album's chunks.
+        try:
+            send_album_safe(
                 chat_id,
-                chunk,
-                protect_content=True
+                media_list
             )
+
+        except Exception as e:
+            print(
+                f"Failed to send album for media_id={media_id}: {e}"
+            )
+
+            try:
+                telegram_call(
+                    bot.send_message,
+                    chat_id,
+                    "⚠️ Telegram đang giới hạn tốc độ gửi. "
+                    "Vui lòng thử lại sau ít giây."
+                )
+            except Exception as notify_error:
+                print(
+                    f"Failed to send error message: {notify_error}"
+                )
+
+            return
 
 
 # =========================================================
@@ -1327,18 +1508,15 @@ print("Bot running...")
 # REMOVE WEBHOOK
 # ---------------------------------------------------------
 
-bot.remove_webhook()
-
 print("Deleting webhook...")
 
 try:
-
     print(
-        bot.remove_webhook()
+        telegram_call(
+            bot.remove_webhook
+        )
     )
-
 except Exception as e:
-
     print(
         f"Webhook remove error: {e}"
     )
@@ -1352,6 +1530,10 @@ print("Starting polling...")
 
 bot.infinity_polling(
     skip_pending=True,
-    timeout=20,
-    long_polling_timeout=20
+    timeout=30,
+    long_polling_timeout=30,
+    allowed_updates=[
+        "message",
+        "callback_query"
+    ]
 )
